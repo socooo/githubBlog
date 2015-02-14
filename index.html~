@@ -1,0 +1,8 @@
+---
+  layout: default
+  title: first post
+---
+
+<h2>{{ page.title }}</h2>
+<p>this is my first blog in github</p>
+<p>{{ page.date | date_to_string }}</p>
