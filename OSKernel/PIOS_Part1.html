@@ -1,0 +1,417 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>PIOS_Part1</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+<style type="text/css">
+/* GitHub stylesheet for MarkdownPad (http://markdownpad.com) */
+/* Author: Nicolas Hery - http://nicolashery.com */
+/* Version: b13fe65ca28d2e568c6ed5d7f06581183df8f2ff */
+/* Source: https://github.com/nicolahery/markdownpad-github */
+
+/* RESET
+=============================================================================*/
+
+html, body, div, span, applet, object, iframe, h1, h2, h3, h4, h5, h6, p, blockquote, pre, a, abbr, acronym, address, big, cite, code, del, dfn, em, img, ins, kbd, q, s, samp, small, strike, strong, sub, sup, tt, var, b, u, i, center, dl, dt, dd, ol, ul, li, fieldset, form, label, legend, table, caption, tbody, tfoot, thead, tr, th, td, article, aside, canvas, details, embed, figure, figcaption, footer, header, hgroup, menu, nav, output, ruby, section, summary, time, mark, audio, video {
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+
+/* BODY
+=============================================================================*/
+
+body {
+  font-family: Helvetica, arial, freesans, clean, sans-serif;
+  font-size: 14px;
+  line-height: 1.6;
+  color: #333;
+  background-color: #fff;
+  padding: 20px;
+  max-width: 960px;
+  margin: 0 auto;
+}
+
+body>*:first-child {
+  margin-top: 0 !important;
+}
+
+body>*:last-child {
+  margin-bottom: 0 !important;
+}
+
+/* BLOCKS
+=============================================================================*/
+
+p, blockquote, ul, ol, dl, table, pre {
+  margin: 15px 0;
+}
+
+/* HEADERS
+=============================================================================*/
+
+h1, h2, h3, h4, h5, h6 {
+  margin: 20px 0 10px;
+  padding: 0;
+  font-weight: bold;
+  -webkit-font-smoothing: antialiased;
+}
+
+h1 tt, h1 code, h2 tt, h2 code, h3 tt, h3 code, h4 tt, h4 code, h5 tt, h5 code, h6 tt, h6 code {
+  font-size: inherit;
+}
+
+h1 {
+  font-size: 28px;
+  color: #000;
+}
+
+h2 {
+  font-size: 24px;
+  border-bottom: 1px solid #ccc;
+  color: #000;
+}
+
+h3 {
+  font-size: 18px;
+}
+
+h4 {
+  font-size: 16px;
+}
+
+h5 {
+  font-size: 14px;
+}
+
+h6 {
+  color: #777;
+  font-size: 14px;
+}
+
+body>h2:first-child, body>h1:first-child, body>h1:first-child+h2, body>h3:first-child, body>h4:first-child, body>h5:first-child, body>h6:first-child {
+  margin-top: 0;
+  padding-top: 0;
+}
+
+a:first-child h1, a:first-child h2, a:first-child h3, a:first-child h4, a:first-child h5, a:first-child h6 {
+  margin-top: 0;
+  padding-top: 0;
+}
+
+h1+p, h2+p, h3+p, h4+p, h5+p, h6+p {
+  margin-top: 10px;
+}
+
+/* LINKS
+=============================================================================*/
+
+a {
+  color: #4183C4;
+  text-decoration: none;
+}
+
+a:hover {
+  text-decoration: underline;
+}
+
+/* LISTS
+=============================================================================*/
+
+ul, ol {
+  padding-left: 30px;
+}
+
+ul li > :first-child, 
+ol li > :first-child, 
+ul li ul:first-of-type, 
+ol li ol:first-of-type, 
+ul li ol:first-of-type, 
+ol li ul:first-of-type {
+  margin-top: 0px;
+}
+
+ul ul, ul ol, ol ol, ol ul {
+  margin-bottom: 0;
+}
+
+dl {
+  padding: 0;
+}
+
+dl dt {
+  font-size: 14px;
+  font-weight: bold;
+  font-style: italic;
+  padding: 0;
+  margin: 15px 0 5px;
+}
+
+dl dt:first-child {
+  padding: 0;
+}
+
+dl dt>:first-child {
+  margin-top: 0px;
+}
+
+dl dt>:last-child {
+  margin-bottom: 0px;
+}
+
+dl dd {
+  margin: 0 0 15px;
+  padding: 0 15px;
+}
+
+dl dd>:first-child {
+  margin-top: 0px;
+}
+
+dl dd>:last-child {
+  margin-bottom: 0px;
+}
+
+/* CODE
+=============================================================================*/
+
+pre, code, tt {
+  font-size: 12px;
+  font-family: Consolas, "Liberation Mono", Courier, monospace;
+}
+
+code, tt {
+  margin: 0 0px;
+  padding: 0px 0px;
+  white-space: nowrap;
+  border: 1px solid #eaeaea;
+  background-color: #f8f8f8;
+  border-radius: 3px;
+}
+
+pre>code {
+  margin: 0;
+  padding: 0;
+  white-space: pre;
+  border: none;
+  background: transparent;
+}
+
+pre {
+  background-color: #f8f8f8;
+  border: 1px solid #ccc;
+  font-size: 13px;
+  line-height: 19px;
+  overflow: auto;
+  padding: 6px 10px;
+  border-radius: 3px;
+}
+
+pre code, pre tt {
+  background-color: transparent;
+  border: none;
+}
+
+kbd {
+    -moz-border-bottom-colors: none;
+    -moz-border-left-colors: none;
+    -moz-border-right-colors: none;
+    -moz-border-top-colors: none;
+    background-color: #DDDDDD;
+    background-image: linear-gradient(#F1F1F1, #DDDDDD);
+    background-repeat: repeat-x;
+    border-color: #DDDDDD #CCCCCC #CCCCCC #DDDDDD;
+    border-image: none;
+    border-radius: 2px 2px 2px 2px;
+    border-style: solid;
+    border-width: 1px;
+    font-family: "Helvetica Neue",Helvetica,Arial,sans-serif;
+    line-height: 10px;
+    padding: 1px 4px;
+}
+
+/* QUOTES
+=============================================================================*/
+
+blockquote {
+  border-left: 4px solid #DDD;
+  padding: 0 15px;
+  color: #777;
+}
+
+blockquote>:first-child {
+  margin-top: 0px;
+}
+
+blockquote>:last-child {
+  margin-bottom: 0px;
+}
+
+/* HORIZONTAL RULES
+=============================================================================*/
+
+hr {
+  clear: both;
+  margin: 15px 0;
+  height: 0px;
+  overflow: hidden;
+  border: none;
+  background: transparent;
+  border-bottom: 4px solid #ddd;
+  padding: 0;
+}
+
+/* TABLES
+=============================================================================*/
+
+table th {
+  font-weight: bold;
+}
+
+table th, table td {
+  border: 1px solid #ccc;
+  padding: 6px 13px;
+}
+
+table tr {
+  border-top: 1px solid #ccc;
+  background-color: #fff;
+}
+
+table tr:nth-child(2n) {
+  background-color: #f8f8f8;
+}
+
+/* IMAGES
+=============================================================================*/
+
+img {
+  max-width: 100%
+}
+</style>
+</head>
+<body>
+<h1>启动与初始化</h1>
+<hr />
+<h2>1. 引导加载程序（the bootloader）</h2>
+<p>当电脑启动时，就开始执行BIOS，这个程序存储在主板的非易失性内存中。BIOS的作用是准备硬件，然后将控制权交给操作系统。具体地说，是将控制权交给从启动扇区里加载的代码，<strong>启动扇区</strong>即引导盘最开始的512字节的扇区。引导扇区包含<strong>引导加载程序</strong>（the bootloader）: 将内核加载进内存的指令。</p>
+<p>BIOS将引导盘加载到内存地址0x7c00，然后通过设置进程的%ip跳到这个地址。当bootloader开始执行后，处理器模拟Intel 8088，bootloader的工作是让处理器进入更现代的操作模式，使xv6内核从磁盘上加载到内存，然后将控制权交给内核。xv6 bootloader由两个源文件组成。</p>
+<p>bootloader的第一条指令是cli，这条指令关掉处理器中断。中断是硬件设备调用操作系统函数的一种方式，叫做interrupt handler。BIOS是一个小的操作系统，它也有自己的interrupt handler，作为初始化硬件的一部分。但此时BIOS不再运行，所以此时处理硬件设备的中断并不合适，也不安全。当xv6准备好后，将会重启中断。</p>
+<pre><code>
+.globl start
+start:
+  .code16                     # Assemble for 16-bit mode
+  cli                         # Disable interrupts
+  cld                         # String operations increment
+
+</code></pre>
+<p>处理器进入实模式，在这个模式下处理器模拟Intel 8088环境，在实模式中，有16位的通用寄存器，但处理器发送的是20位的内存地址。段寄存器%cs, %ds, %es,  %ss提供从16位寄存器中生成20位地址的附加位。当程序寻找一个内存地址时，处理器自动将段寄存器中的值乘以16。这些寄存器都是16位。不同的段寄存器通常默认存放不同的内存引用：获取指令使用%cs，数据读写使用%ds，栈的读写使用%ss。</p>
+<p>xv6会假装x86指令使用的是虚拟地址来处理内存操作数，但实际上一条x86指令使用的是一个逻辑地址（图B-1）。一个逻辑地址由一个段选择器和一个偏移组成，写成 <strong>段：偏移</strong>。将段隐藏起来而让程序直接操纵偏移量是一种更常见的做法。分段硬件将上述地址转换成一个线性地址。如果启用了分页硬件，它将线性地址转换成物理地址，否则处理器把线性地址作为物理地址使用。</p>
+<p><img src="http://i.imgur.com/iJbSPxl.png" />
+bootloader没有开启分页，它使用的逻辑地址被分段硬件转换成线性地址后直接当作物理地址使用。xv6通过分段硬件将逻辑地址设置为线性地址。由于历史原因，我们使用术语“虚拟地址”来代表被程序操作的地址，一个xv6的虚拟地址也就是x86的逻辑地址，在分段硬件的映射下同样也是线性地址。一旦分页打开，系统中唯一需要被关心的地址映射是从线性地址到物理地址。BIOS不能保证%ds, %es, %ss里的内容，所以关中断后的第一步就是将%ax置0拷贝给上述寄存器。</p>
+<pre><code>
+# Set up the important data segment registers (DS, ES, SS).
+  xorw    %ax,%ax             # Segment number zero
+  movw    %ax,%ds             # -> Data Segment
+  movw    %ax,%es             # -> Extra Segment
+  movw    %ax,%ss             # -> Stack Segment
+
+</code></pre>
+<p>一个虚拟的 段：偏移 能够产生一个21位的物理地址，但Intel 8088只能处理20位地址，所以<code>0xffff0+0xffff = 0x10ffef</code>的最高位被丢掉。这就是说虚拟地址 <code>0xffff:0xffff</code>在8088里被映射到了地址0x0ffef。一些早期依赖于硬件的软件会忽略掉第21个地址位，所以当Intel引进物理地址高于20位的处理器时，IBM提供了一个满足PC兼容硬件的兼容方法。如果键盘控制器的输出端口为0，则第21位物理地址被屏蔽，否则，21位正常使用。bootloader必须使用键盘控制器的I/O端口0x64和0x60来打开第21位地址。</p>
+<pre><code>
+  # Enable A20:
+  #   For backwards compatibility with the earliest PCs, physical
+  #   address line 20 is tied low, so that addresses higher than
+  #   1MB wrap around to zero by default.  This code undoes this.
+seta20.1:
+  inb     $0x64,%al               # Wait for not busy
+  testb   $0x2,%al
+  jnz     seta20.1
+
+  movb    $0xd1,%al               # 0xd1 -> port 0x64
+  outb    %al,$0x64
+
+seta20.2:
+  inb     $0x64,%al               # Wait for not busy
+  testb   $0x2,%al
+  jnz     seta20.2
+
+  movb    $0xdf,%al               # 0xdf -> port 0x60
+  outb    %al,$0x60
+
+</code></pre>
+<p>实模式的16位通用寄存器和16位段寄存器在使用超过65,536字节的内存时很困难，而且不能使用超过1MB的内存。从80286开始，x86处理器新增了一个保护模式，可以让物理地址有更多位，并且（从80386开始）一个32位模式使得寄存器，虚拟地址和大多数整数算法用32位实现，而不是16位。xv6引导过程开启保护模式和32位模式的过程如下。</p>
+<p>在保护模式中，一个段寄存器是一个段描述符表的索引（如图B-2）。每个表项都放着一个物理基地址，一个最大虚拟地址即界限，和是否允许进段的标志位。这些就是保护模式中的保护：内核可以使用它们来确认一个程序只使用自己的地址。</p>
+<p><img src="http://i.imgur.com/SuZYoPw.png" /></p>
+<p>bootloader设置段描述符表GDT使得所有段都有一个基地址0和一个最大的界限（4G）。</p>
+<pre><code>
+# Bootstrap GDT
+.p2align 2                                # force 4 byte alignment
+gdt:
+  SEG_NULL				# null seg
+  SEG(STA_X|STA_R, 0x0, 0xffffffff)	# code seg
+  SEG(STA_W, 0x0, 0xffffffff)	        # data seg
+
+</pre><p></code>
+该表有一个空项，一个可执行代码项，一个数据项。代码段描述符有一组标志位，指示出代码应该运行在32位模式。当bootloader进入保护模式，逻辑地址一一映射到物理地址。</p>
+<p>bootloader执行一个lgdt指令，将gdtdesc加到gdt全局描述符表（GDT）寄存器中。</p>
+<pre><code>
+  # Switch from real to protected mode, using a bootstrap GDT
+  # and segment translation that makes virtual addresses 
+  # identical to their physical addresses, so that the 
+  # effective memory map does not change during the switch.
+  lgdt    gdtdesc
+  movl    %cr0, %eax
+  orl     $CR0_PE_ON, %eax
+  movl    %eax, %cr0
+
+
+gdtdesc:
+  .word   0x17                            # sizeof(gdt) - 1
+  .long   gdt                             # address gdt
+
+</pre><p></code></p>
+<p>一旦bootloader加载了GDT寄存器，它将通过对寄存器%cr的CR0_PE位置一的方式开启保护模式。开启保护模式的时候并不会立即改变处理器将逻辑地转换成物理地址的方式；只有当段寄存器加载一个新值时，处理器才会读GDT然后改变它的内部段设置。%cs里的值不能被直接修改，所以代码会执行一个ljmp指令（长跳转）来指定一个代码段选择器。跳转使得程序继续下一行执行，但这样做可以将%cs指向gdt中的代码描述符项。描述符描述了一个32位的代码段，所以处理器切换进32位模式。bootloader维护着处理器从8088到80286再到80386的进化。</p>
+<p>bootloader在32位模式中的做的第一件事就是使用SEG_KDATA初始化数据段寄存器。逻辑地址现在直接映射到物理地址。执行C代码前剩余的唯一步骤就是在内存未被使用的区域内设置一个栈。内存0xa0000到0x100000是典型的设备内存区，xv6内核一般会安置在0x100000。bootloader放置在0x7c00到0x7d00这片区域。实质上，内存的其他区域都适合安置栈。bootloader选择0x7c00，即这个文件（bootasm.S）中的$start，作为栈顶，栈从这里往下走，直到0x0000。</p>
+<pre><code>
+  # Jump to next instruction, but in 32-bit code segment.
+  # Switches processor into 32-bit mode.
+  ljmp    $PROT_MODE_CSEG, $protcseg
+
+  .code32                     # Assemble for 32-bit mode
+protcseg:
+  # Set up the protected-mode data segment registers
+  movw    $PROT_MODE_DSEG, %ax    # Our data segment selector
+  movw    %ax, %ds                # -> DS: Data Segment
+  movw    %ax, %es                # -> ES: Extra Segment
+  movw    %ax, %fs                # -> FS
+  movw    %ax, %gs                # -> GS
+  movw    %ax, %ss                # -> SS: Stack Segment
+
+</pre><p></code></p>
+<p>最后，bootloader调用C程序bootmain。bootmain的作用是加载并运行操作系统内核。只有在出错的情况下返回。因此，代码发送一些输出给端口0x8a00。在一个真实的硬件中，没有设备连接到这个端口，所以这段代码不做任何事。如果bootloader运行在一个PC模拟器中，这个端口连接到模拟器自己，然后将控制权交给模拟器。然后代码执行一个死循环。一个真实的bootloader可能会先试图打印一条错误信息。bootloader的C代码部分，bootmain.c，会在磁盘第二个扇区开始的地方寻找一个内核可执行文件的拷贝，内核是一个ELF格式的二进制文件。为了获得ELF的文件头，bootmain加载ELF二进制文件的头4096字节，将它放在内存地址为0x10000的地方。</p>
+<pre><code>
+  # Set up the stack pointer and call into C.
+  movl    $start, %esp
+  call bootmain
+
+  # If bootmain returns (it shouldn't), loop.
+spin:
+  jmp spin
+
+</pre><p></code></p>
+<p>下一步，是快速检查这是不是一个ELF二进制文件。bootmain从磁盘中ELF头偏移off字节的位置读取扇区的内容，写入内存中从paddr开始的位置。bootmain调用readseg从磁盘加载文件，并且调用stosb将段的剩余空间置0。stosb使用x86指令rep stosb初始化一个内存块的所有字节。
+内核已经被编译连接好，所以它期望在虚拟地址0x80100000找到自己。即函数调用指令提到的类似0xf01xxxxx的目的地址，你可以在kernel.asm中看到相关例子。这个地址由kernel.ld配置。0x80100000是一个相对高地址，指向32位地址空间的最后部分。可能没有一个物理地址能有这么高。一旦内核开始运行，它就通过分页硬件将虚拟地址0x80100000映射到0x00100000；内核假设在这个低地址上有物理内存。然而，此时在引导进程中并没有开启分页硬件。相应的，kernel.ld指明ELF的paddr从0x100000开始，这会导致bootloader将内核拷贝到低物理地址中，分页硬件最终会指向这个地址。</p>
+<p>bootloader的最后步骤是调用内核入口指针，这个指针是内核期望一开始执行的指令。在xv6中，入口地址是0x10000c：（如下）</p>
+<pre><code># objdump -f kernel
+kernel: file format elf32-i386
+architecture: i386, flags 0x00000112:
+EXEC_P, HAS_SYMS, D_PAGED
+start address 0x0010000c</code></pre>
+<p>按照惯例，符号_start指明ELF的入口地址，这被定义在entry.S文件中。由于xv6没有设置虚拟地址，xv6的入口是物理地址。</p>
+<hr />
+<h2>2. 陷阱处理</h2>
+
+</body>
+</html>
+<!-- This document was created with MarkdownPad, the Markdown editor for Windows (http://markdownpad.com) -->
