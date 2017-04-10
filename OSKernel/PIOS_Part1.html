@@ -291,126 +291,284 @@ img {
 </style>
 </head>
 <body>
-<h1>启动与初始化</h1>
+<h1>系统初始化</h1>
+<h2>1. 陷阱处理</h2>
+<h3>中断描述符表（IDT）</h3>
+<p>在产生陷阱时，内核使用中断描述符表（IDT）来决定如何转移控制权。PIOS有256个进入内核的中断，异常入口点，每个入口点附带一个中断向量。中断向量由中断源确定：不同的设备、错误条件及应用请求产生不同的中断向量。CPU使用中断向量作为进入IDT的索引。处理器会通过IDT中的条目加载以下内容：</p>
+<ul>
+<li>需要加载到EIP中的值，指向能处理该类型异常的内核代码。</li>
+<li>需要加载到代码段（CS）寄存器的值。</li>
+</ul>
+<h3>陷阱处理器</h3>
+<p>当处理器在内核模式下接收到一个陷阱时，首先会将一个陷阱帧压入内核栈，以此来保存某些寄存器的值，这些值在陷阱处里的过程中可能会被修改。然后处理器在IDT中查看陷阱处理器的CS与EIP，并将控制权转交给它。下图展示了一个内核陷阱帧的格式：</p>
+<p>+----------------------+ &lt;---- old ESP<br>
+| &nbsp;&nbsp;&nbsp;&nbsp;old EFLAGS&nbsp;&nbsp;&nbsp;&nbsp;|     &quot; &nbsp;&nbsp;- 4<br>
+|&nbsp;0x00000 | old CS&nbsp;|     &quot;&nbsp;&nbsp; - 8<br>
+|&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; old EIP&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |     &quot;&nbsp;&nbsp; - 12<br>
++----------------------+ &lt;---- ESP</p>
+<p>有些异常的类型会包含一个错误码信息，例如14号页错误异常，包含错误码的陷阱帧格式如下：</p>
+<p>+----------------------+ &lt;---- old ESP<br>
+| &nbsp;&nbsp;&nbsp;&nbsp;old EFLAGS&nbsp;&nbsp;&nbsp;&nbsp;|     &quot; &nbsp;&nbsp;- 4<br>
+|&nbsp;0x00000 | old CS&nbsp;|     &quot;&nbsp;&nbsp; - 8<br>
+|&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; old EIP&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |     &quot;&nbsp;&nbsp; - 12<br>
+|&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; error code&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp; |     &quot; - 16<br>
++----------------------+ &lt;---- ESP</p>
+<p>x86处理器提供了一条特殊的指令：iret，用于从陷阱处理器中返回。执行这条指令需要内核栈如第一张图所示的那样，ESP指向旧的EIP。当处理器执行 iret 指令时，保存的EIP,CS及EFLAGS的内容出栈并进入相应的寄存器中，通过弹出的EIP继续执行接下来的指令。</p>
+<h3>设置IDT</h3>
+<p>总体的控制流程如下图所示：</p>
+<p><img src="http://i.imgur.com/0rUOEmf.png" /></p>
+<p>在 trapasm.S 中，每个异常都有自己的handler。</p>
+<pre><code>#define TRAPHANDLER(name, num)                      //traphandler with &quot;error code&quot;.
+  .globl name;      /* define global symbol for 'name' */   
+  .type name, @function;    /* symbol type is function */       
+  .align 2;     /* align function definition */     
+  name:         /* function starts here */      
+  pushl $(num);                         
+  jmp _alltraps
+</code></pre>
+
+<p>每个handler都要在栈上构造一个结构体 struct trapframe （见inc/trap.h），并调用 trap.c 中的 trap()。</p>
+<pre><code>.globl _alltraps
+_alltraps:
+    pushl %ds
+    pushl %es
+    pushl %fs
+    pushl %gs
+    pushal
+
+    movw $(CPU_GDT_KDATA), %ax
+    movw %ax, %es
+    movw %ax, %ds
+    pushl %esp
+    call trap
+</code></pre>
+
+<p>trap.c 的 trap_init_idt() 使用这些handler的地址来初始化IDT。</p>
+<pre><code>
+static void
+trap_init_idt(void)					//init the IDT with the TRAPHANDLER.
+{
+	int i;
+	extern segdesc gdt[];
+	for(i=0; i<=50; i++){
+		SETGATE(idt[i], 0, CPU_GDT_KCODE, vectors[i], 0);
+	}
+	SETGATE(idt[T_BRKPT], 0,CPU_GDT_KCODE, vectors[T_BRKPT], 3);
+	SETGATE(idt[T_OFLOW], 0,CPU_GDT_KCODE, vectors[T_OFLOW], 3);
+	SETGATE(idt[T_SYSCALL], 0,CPU_GDT_KCODE, vectors[T_SYSCALL], 3);
+}
+
+</code></pre>
+<p>trap()处理异常/中断或分发给其他处理函数。trap()返回时，trapasm.S 还原处理器状态，并使用 iret 指令从异常状态返回。</p>
+<pre><code>.globl  trap_return
+.type   trap_return,@function
+.p2align 4, 0x90        /* 16-byte alignment, nop filled */
+trap_return:
+    addl $4, %esp
+    movl (%esp), %esp
+    popal
+    popl %gs
+    popl %fs
+    popl %es
+    popl %ds
+    addl $8, %esp
+    iret
+</code></pre>
+
+<h2>2. 权限等级与受保护的控制转移</h2>
+<p>x86处理器提供了多个权限等级或环可以让操作系统用来保护敏感的处理器状态。例如x86限定了 lidt 指令只能在 ring 0 下运行，因此，内核就能阻止应用程序在较低权限等级里执行 lidt 以及其他敏感指令。</p>
+<h3>受保护的控制转移的基本原理</h3>
+<p>当处理器运行在用户模式（ring 3）中时，如果遇到一个陷阱或系统调用，处理器必须将控制权转移给内核，但此时不能让用户模式的代码随意选择从哪进入内核，或如何进入内核，这对于保护机制来说至关重要。处理器要保证在谨慎的控制条件下进入内核，在x86中，由以下两个机制共同提供保护：</p>
+<ul>
+<li><strong>中断描述符表（IDT）</strong> 通过 IDT，处理器能确保中断与异常只在特定的、定义好的入口点处进入内核，这些入口点是由内核自己定义的，而不是由产生中断和异常时正在运行的代码决定。</li>
+<li><strong>任务状态段（TSS）</strong> 在中断或异常发生时，处理器需要一个地方来保存旧的处理器状态。而这个保存区域必须避免受到非特权用户模式代码的干扰。因此，当一个陷阱或中断使得当前的权限从用户模式切换到内核模式时，同样也要将栈切换到内核的内存中。TSS	结构体指定了这个栈的段选择器与地址。处理器将 SS、ESP、EFLAGS、CS、EIP以及可选的 error code 压入这个新栈，然后从中断描述符中加载 CS 与 EIP，并设置 ESP 与 SS。</li>
+</ul>
+<p>IDT 和 TSS 联合为内核提供了一套机制，这套机制确保陷阱只能通过调用内核中定义好的入口点（ IDT 中的中断向量）来处理，同时陷阱处理器拥有一个定义好的，受保护的工作空间（ TSS 中的栈指针）。</p>
+<h3>例子</h3>
+<p>假设处理器正在用户模式下执行代码，并遇到了一个试图除零的指令。</p>
+<ol>
+<li>
+<p>处理器将栈切换到 TSS 的 SS0 和 ESP0 域定义的栈中。这两个域的值分别保留在 CPU<em>GDT</em>KDATA 与 &amp;cpu-&gt;kstackhi 中。</p>
+<pre><code>// Set the tss's field, so that when switch the stack, cpu can find where the kenrnel stack set. 
+c-&gt;tss.ts_ss0 = CPU_GDT_KDATA;
+c-&gt;tss.ts_esp0 = (uintptr_t)(c-&gt;kstackhi);
+c-&gt;gdt[CPU_GDT_TSS &gt;&gt; 3] = SEGDESC16(0, STS_T32A, (uintptr_t)(&amp;c-&gt;tss),  sizeof(c-&gt;tss)-1, 0);
+ltr(CPU_GDT_TSS);
+</code></pre>
+
+</li>
+<li>
+<p>处理器将下图的陷阱帧压入内核栈。</p>
+<pre><code>             +--------------------+ &amp;cpu-&gt;kstackhi
+             | 0x00000 | old SS   |     &quot; - 4
+             |      old ESP       |     &quot; - 8
+             |     old EFLAGS     |     &quot; - 12
+             | 0x00000 | old CS   |     &quot; - 16
+             |      old EIP       |     &quot; - 20 &lt;---- ESP 
+             +--------------------+  &lt;---- ESP
+</code></pre>
+
+</li>
+<li>
+<p>由于现在是在处理除零错误，即x86的0号中断向量，处理器读出IDT第0项，设置 CS:EIP 指向 handler 函数。</p>
+</li>
+<li>handler 函数获得控制权并处理该异常。</li>
+</ol>
+<h3>进入用户模式</h3>
+<p>x86处理器使用 CS 寄存器的最低两位作为权限等级的标志位。内核与用户状态下的代码段与数据段存放在 gdt （全局描述符表）结构体中。</p>
+<pre><code>gdt: {
+    // 0x0 - unused (always faults: for trapping NULL far pointers)
+    [0] = SEGDESC_NULL,
+
+    // 0x08 - kernel code segment
+    [CPU_GDT_KCODE &gt;&gt; 3] = SEGDESC32(1, STA_X | STA_R, 0x0,
+                0xffffffff, 0),
+
+    // 0x10 - kernel data segment
+    [CPU_GDT_KDATA &gt;&gt; 3] = SEGDESC32(1, STA_W, 0x0,
+                0xffffffff, 0),     
+    // 0x20 - user data segment
+    [CPU_GDT_UDATA &gt;&gt; 3] = SEGDESC32(1, STA_W, 0x0, 
+                0xffffffff, 3),
+    // 0x18 - user code segment
+    [CPU_GDT_UCODE &gt;&gt; 3] = SEGDESC32(1, STA_X|STA_R,0x0,
+                0xffffffff, 3 ),
+
+    [CPU_GDT_UDTLS &gt;&gt; 3] = SEGDESC32(1, STA_W, 0x0, 
+                0xffffffff, 3),
+}
+</code></pre>
+
+<p>前面的内容描述了处理器如何通过陷阱离开用户模式，进入内核模式。那么怎样从一开始的内核模式进入到用户模式中呢？很简单，从内核“返回”到用户模式 -- 即使处理器之前从没有进入过内核模式。</p>
+<p>当处理器执行 iret 指令时，会从栈中弹出陷阱帧。但处理器并不关心这个栈帧是之前压到栈上的还是从其他地方得到的。因此内核能制造一个栈帧，这个栈帧包含了处理器想要用户模式的状态，然后通过 iret 指令“返回”到用户模式。</p>
+<pre><code>.globl  trap_return
+.type   trap_return,@function
+.p2align 4, 0x90        /* 16-byte alignment, nop filled */
+trap_return:
+    addl $4, %esp
+    movl (%esp), %esp
+    popal
+    popl %gs
+    popl %fs
+    popl %es
+    popl %ds
+    addl $8, %esp
+    iret
+</code></pre>
+
 <hr />
-<h2>1. 引导加载程序（the bootloader）</h2>
-<p>当电脑启动时，就开始执行BIOS，这个程序存储在主板的非易失性内存中。BIOS的作用是准备硬件，然后将控制权交给操作系统。具体地说，是将控制权交给从启动扇区里加载的代码，<strong>启动扇区</strong>即引导盘最开始的512字节的扇区。引导扇区包含<strong>引导加载程序</strong>（the bootloader）: 将内核加载进内存的指令。</p>
-<p>BIOS将引导盘加载到内存地址0x7c00，然后通过设置进程的%ip跳到这个地址。当bootloader开始执行后，处理器模拟Intel 8088，bootloader的工作是让处理器进入更现代的操作模式，使xv6内核从磁盘上加载到内存，然后将控制权交给内核。xv6 bootloader由两个源文件组成。</p>
-<p>bootloader的第一条指令是cli，这条指令关掉处理器中断。中断是硬件设备调用操作系统函数的一种方式，叫做interrupt handler。BIOS是一个小的操作系统，它也有自己的interrupt handler，作为初始化硬件的一部分。但此时BIOS不再运行，所以此时处理硬件设备的中断并不合适，也不安全。当xv6准备好后，将会重启中断。</p>
-<pre><code>
-.globl start
-start:
-  .code16                     # Assemble for 16-bit mode
-  cli                         # Disable interrupts
-  cld                         # String operations increment
-
+<pre><code>//构造一个进入用户程序的栈帧
+ trapframe tf = {
+    gs: CPU_GDT_UDATA | 3,          // 最低2位 “| 3”， 表示权限为 ring 3.
+    fs: CPU_GDT_UDATA | 3,
+    es: CPU_GDT_UDATA | 3,
+    ds: CPU_GDT_UDATA | 3,
+    cs: CPU_GDT_UCODE | 3,
+    ss: CPU_GDT_UDATA | 3,
+    eip: (uint32_t)user,                        //eip指向要执行的用户程序的位置。
+    esp: (uint32_t)&amp;user_stack[PAGESIZE],
+};
+trap_return(&amp;tf);       //调用上面的 trap_return
 </code></pre>
-<p>处理器进入实模式，在这个模式下处理器模拟Intel 8088环境，在实模式中，有16位的通用寄存器，但处理器发送的是20位的内存地址。段寄存器%cs, %ds, %es,  %ss提供从16位寄存器中生成20位地址的附加位。当程序寻找一个内存地址时，处理器自动将段寄存器中的值乘以16。这些寄存器都是16位。不同的段寄存器通常默认存放不同的内存引用：获取指令使用%cs，数据读写使用%ds，栈的读写使用%ss。</p>
-<p>xv6会假装x86指令使用的是虚拟地址来处理内存操作数，但实际上一条x86指令使用的是一个逻辑地址（图B-1）。一个逻辑地址由一个段选择器和一个偏移组成，写成 <strong>段：偏移</strong>。将段隐藏起来而让程序直接操纵偏移量是一种更常见的做法。分段硬件将上述地址转换成一个线性地址。如果启用了分页硬件，它将线性地址转换成物理地址，否则处理器把线性地址作为物理地址使用。</p>
-<p><img src="http://i.imgur.com/iJbSPxl.png" />
-bootloader没有开启分页，它使用的逻辑地址被分段硬件转换成线性地址后直接当作物理地址使用。xv6通过分段硬件将逻辑地址设置为线性地址。由于历史原因，我们使用术语“虚拟地址”来代表被程序操作的地址，一个xv6的虚拟地址也就是x86的逻辑地址，在分段硬件的映射下同样也是线性地址。一旦分页打开，系统中唯一需要被关心的地址映射是从线性地址到物理地址。BIOS不能保证%ds, %es, %ss里的内容，所以关中断后的第一步就是将%ax置0拷贝给上述寄存器。</p>
-<pre><code>
-# Set up the important data segment registers (DS, ES, SS).
-  xorw    %ax,%ax             # Segment number zero
-  movw    %ax,%ds             # -> Data Segment
-  movw    %ax,%es             # -> Extra Segment
-  movw    %ax,%ss             # -> Stack Segment
 
-</code></pre>
-<p>一个虚拟的 段：偏移 能够产生一个21位的物理地址，但Intel 8088只能处理20位地址，所以<code>0xffff0+0xffff = 0x10ffef</code>的最高位被丢掉。这就是说虚拟地址 <code>0xffff:0xffff</code>在8088里被映射到了地址0x0ffef。一些早期依赖于硬件的软件会忽略掉第21个地址位，所以当Intel引进物理地址高于20位的处理器时，IBM提供了一个满足PC兼容硬件的兼容方法。如果键盘控制器的输出端口为0，则第21位物理地址被屏蔽，否则，21位正常使用。bootloader必须使用键盘控制器的I/O端口0x64和0x60来打开第21位地址。</p>
-<pre><code>
-  # Enable A20:
-  #   For backwards compatibility with the earliest PCs, physical
-  #   address line 20 is tied low, so that addresses higher than
-  #   1MB wrap around to zero by default.  This code undoes this.
-seta20.1:
-  inb     $0x64,%al               # Wait for not busy
-  testb   $0x2,%al
-  jnz     seta20.1
-
-  movb    $0xd1,%al               # 0xd1 -> port 0x64
-  outb    %al,$0x64
-
-seta20.2:
-  inb     $0x64,%al               # Wait for not busy
-  testb   $0x2,%al
-  jnz     seta20.2
-
-  movb    $0xdf,%al               # 0xdf -> port 0x60
-  outb    %al,$0x60
-
-</code></pre>
-<p>实模式的16位通用寄存器和16位段寄存器在使用超过65,536字节的内存时很困难，而且不能使用超过1MB的内存。从80286开始，x86处理器新增了一个保护模式，可以让物理地址有更多位，并且（从80386开始）一个32位模式使得寄存器，虚拟地址和大多数整数算法用32位实现，而不是16位。xv6引导过程开启保护模式和32位模式的过程如下。</p>
-<p>在保护模式中，一个段寄存器是一个段描述符表的索引（如图B-2）。每个表项都放着一个物理基地址，一个最大虚拟地址即界限，和是否允许进段的标志位。这些就是保护模式中的保护：内核可以使用它们来确认一个程序只使用自己的地址。</p>
-<p><img src="http://i.imgur.com/SuZYoPw.png" /></p>
-<p>bootloader设置段描述符表GDT使得所有段都有一个基地址0和一个最大的界限（4G）。</p>
-<pre><code>
-# Bootstrap GDT
-.p2align 2                                # force 4 byte alignment
-gdt:
-  SEG_NULL				# null seg
-  SEG(STA_X|STA_R, 0x0, 0xffffffff)	# code seg
-  SEG(STA_W, 0x0, 0xffffffff)	        # data seg
-
-</pre><p></code>
-该表有一个空项，一个可执行代码项，一个数据项。代码段描述符有一组标志位，指示出代码应该运行在32位模式。当bootloader进入保护模式，逻辑地址一一映射到物理地址。</p>
-<p>bootloader执行一个lgdt指令，将gdtdesc加到gdt全局描述符表（GDT）寄存器中。</p>
-<pre><code>
-  # Switch from real to protected mode, using a bootstrap GDT
-  # and segment translation that makes virtual addresses 
-  # identical to their physical addresses, so that the 
-  # effective memory map does not change during the switch.
-  lgdt    gdtdesc
-  movl    %cr0, %eax
-  orl     $CR0_PE_ON, %eax
-  movl    %eax, %cr0
-
-
-gdtdesc:
-  .word   0x17                            # sizeof(gdt) - 1
-  .long   gdt                             # address gdt
-
-</pre><p></code></p>
-<p>一旦bootloader加载了GDT寄存器，它将通过对寄存器%cr的CR0_PE位置一的方式开启保护模式。开启保护模式的时候并不会立即改变处理器将逻辑地转换成物理地址的方式；只有当段寄存器加载一个新值时，处理器才会读GDT然后改变它的内部段设置。%cs里的值不能被直接修改，所以代码会执行一个ljmp指令（长跳转）来指定一个代码段选择器。跳转使得程序继续下一行执行，但这样做可以将%cs指向gdt中的代码描述符项。描述符描述了一个32位的代码段，所以处理器切换进32位模式。bootloader维护着处理器从8088到80286再到80386的进化。</p>
-<p>bootloader在32位模式中的做的第一件事就是使用SEG_KDATA初始化数据段寄存器。逻辑地址现在直接映射到物理地址。执行C代码前剩余的唯一步骤就是在内存未被使用的区域内设置一个栈。内存0xa0000到0x100000是典型的设备内存区，xv6内核一般会安置在0x100000。bootloader放置在0x7c00到0x7d00这片区域。实质上，内存的其他区域都适合安置栈。bootloader选择0x7c00，即这个文件（bootasm.S）中的$start，作为栈顶，栈从这里往下走，直到0x0000。</p>
-<pre><code>
-  # Jump to next instruction, but in 32-bit code segment.
-  # Switches processor into 32-bit mode.
-  ljmp    $PROT_MODE_CSEG, $protcseg
-
-  .code32                     # Assemble for 32-bit mode
-protcseg:
-  # Set up the protected-mode data segment registers
-  movw    $PROT_MODE_DSEG, %ax    # Our data segment selector
-  movw    %ax, %ds                # -> DS: Data Segment
-  movw    %ax, %es                # -> ES: Extra Segment
-  movw    %ax, %fs                # -> FS
-  movw    %ax, %gs                # -> GS
-  movw    %ax, %ss                # -> SS: Stack Segment
-
-</pre><p></code></p>
-<p>最后，bootloader调用C程序bootmain。bootmain的作用是加载并运行操作系统内核。只有在出错的情况下返回。因此，代码发送一些输出给端口0x8a00。在一个真实的硬件中，没有设备连接到这个端口，所以这段代码不做任何事。如果bootloader运行在一个PC模拟器中，这个端口连接到模拟器自己，然后将控制权交给模拟器。然后代码执行一个死循环。一个真实的bootloader可能会先试图打印一条错误信息。bootloader的C代码部分，bootmain.c，会在磁盘第二个扇区开始的地方寻找一个内核可执行文件的拷贝，内核是一个ELF格式的二进制文件。为了获得ELF的文件头，bootmain加载ELF二进制文件的头4096字节，将它放在内存地址为0x10000的地方。</p>
-<pre><code>
-  # Set up the stack pointer and call into C.
-  movl    $start, %esp
-  call bootmain
-
-  # If bootmain returns (it shouldn't), loop.
-spin:
-  jmp spin
-
-</pre><p></code></p>
-<p>下一步，是快速检查这是不是一个ELF二进制文件。bootmain从磁盘中ELF头偏移off字节的位置读取扇区的内容，写入内存中从paddr开始的位置。bootmain调用readseg从磁盘加载文件，并且调用stosb将段的剩余空间置0。stosb使用x86指令rep stosb初始化一个内存块的所有字节。
-内核已经被编译连接好，所以它期望在虚拟地址0x80100000找到自己。即函数调用指令提到的类似0xf01xxxxx的目的地址，你可以在kernel.asm中看到相关例子。这个地址由kernel.ld配置。0x80100000是一个相对高地址，指向32位地址空间的最后部分。可能没有一个物理地址能有这么高。一旦内核开始运行，它就通过分页硬件将虚拟地址0x80100000映射到0x00100000；内核假设在这个低地址上有物理内存。然而，此时在引导进程中并没有开启分页硬件。相应的，kernel.ld指明ELF的paddr从0x100000开始，这会导致bootloader将内核拷贝到低物理地址中，分页硬件最终会指向这个地址。</p>
-<p>bootloader的最后步骤是调用内核入口指针，这个指针是内核期望一开始执行的指令。在xv6中，入口地址是0x10000c：（如下）</p>
-<pre><code># objdump -f kernel
-kernel: file format elf32-i386
-architecture: i386, flags 0x00000112:
-EXEC_P, HAS_SYMS, D_PAGED
-start address 0x0010000c</code></pre>
-<p>按照惯例，符号_start指明ELF的入口地址，这被定义在entry.S文件中。由于xv6没有设置虚拟地址，xv6的入口是物理地址。</p>
 <hr />
-<h2>2. 陷阱处理</h2>
+<pre><code>//用户程序
+void
+user()
+{
+    cprintf(&quot;in user()\n&quot;);
+    done();
+}
+</code></pre>
+
+<h2>3.物理页分配</h2>
+<h3>分页硬件</h3>
+<p>页表是操作系统用来控制地址的机制。它可以让xv6将不同进程的地址空间复用到同一个物理地址，并保护不同进程的内存。由页表提供的间接的等级同样是一种资源，它可以用在很多精妙的技巧中。xv6使用页表主要是为了复用地址空间和保护内存。它也使用一些页表技巧：将相同的（内核）内存映射到数个地址空间，将相同的内存多次映射到同一个地址空间（每个用户表也映射到物理上的内核地址），并用一个未映射的页保护一个用户栈。</p>
+<p>x86指令（包括内核和用户）操纵虚拟地址。机器的RAM，或者说是物理内存，由物理地址索引。x86页表硬件通过将每个虚拟地址映射到物理地址来连接两种地址。</p>
+<p>一个x86的页表逻辑上是一个含有2^20（1048576）个页表项（PTE）的数组。每个页表项包含一个20位的物理页号（PPN）和一些标志位。分页硬件转译一个虚拟地址的方式是使用它的最高20位从页表中找到相应的PTE，然后用PTE里的PPN替换掉地址的最高20位。分页硬件将低12位从虚拟地址拷贝到转译后的物理地址。因此，操作系统就可以通过页表控制虚拟物理地址间的转换，这种转换是在一个粒度大小为4096字节的块上，这个块就称为页。</p>
+<p>如下图，实际的转换分两步。一个页表作为一个两级树存储在物理内存中。树的根是一个4096字节的页目录，包含了1024个PTE，这些PTE引用了页表页。每个页表页是一个含有1024个32位PTE的数组。分页硬件使用一个虚拟地址的最高10位选择一个页目录项，如果存在，分页硬件使用虚拟地址接下来的10位从页表页中选择一个PTE。</p>
+<p><img src="http://i.imgur.com/2pdpmv6.png" /></p>
+<p>每个PTE都有标志位，这些标志位会告诉分页硬件怎样去联系虚拟地址。PTE_P标明PTE是否存在，如果改位未被设置，则对该页的引用会产生一个错误。PTE_W控制是否能向该页写，PTE_U标明用户程序是否能使用该页。图2-1展示了这些位的使用，相关的结构体定义在mmu.h。</p>
+<p>下面说明一些术语。物理内存指DRAM中的存储单元。一个物理内存字节有一个地址，叫做物理地址。指令只使用虚拟地址，这些虚拟地址会被分页硬件转译成物理地址，然后发送给DRAM来读写内存。在目前的讨论层次中没有虚拟内存，只有虚拟地址。</p>
+<h3>内存初始化</h3>
+<pre><code>void
+mem_init(void)
+{
+    warn(&quot;Assuming we have 1GB of memory!&quot;);
+    extmem = 1024*1024*1024 - MEM_EXT;  // assume 1GB total memory
+
+    // The maximum physical address is the top of extended memory.
+    mem_max = MEM_EXT + extmem;
+
+    // Compute the total number of physical pages (including I/O holes)
+    mem_npage = mem_max / PAGESIZE;
+
+    pageinfo **freetail = &amp;mem_freelist;
+    int i;
+
+    //  为 mem_pageinfo 数组分配物理内存，分配的内存需要容纳下 mem_npage 的所有项。
+    mem_pageinfo = tmp_pageinfo;
+    memset(tmp_pageinfo, 0, (sizeof(pageinfo)*1024*1024*1024)/PAGESIZE);
+
+    // 添加所有的 pageinfo 结构体到 mem_pageinfo 数组中，这个数组代表了所有的可用页。
+    for (i = 0; i &lt; mem_npage; i++) {
+        // A free page has no references to it.
+        mem_pageinfo[i].refcount = 0;
+
+        // 第0页保留给 IDT 和 BIOS 结构体。
+        // 第一页保留给启动引导程序代码。
+        if(i == 0 || i == 1)    
+            continue;
+
+        // [MEM_IO, MEM_EXT) 保留给 I/O 空间。
+        if(i &gt;= MEM_IO/PAGESIZE &amp;&amp; i &lt; MEM_EXT/PAGESIZE)
+            continue;
+
+        // 为当前运行的 kernel 进程保留内存空间。
+        if(i &gt;= ((uint32_t)start)/PAGESIZE &amp;&amp; i &lt;= ((uint32_t)end)/PAGESIZE)
+            continue;
+
+        // 将剩余的页面标识为可用页面。
+        *freetail = &amp;mem_pageinfo[i];
+        freetail = &amp;mem_pageinfo[i].free_next;
+    }
+    *freetail = NULL;   // null-terminate the freelist
+
+    // ...and remove this when you're ready.
+    //panic(&quot;mem_init() not implemented&quot;);
+
+    // Check to make sure the page allocator seems to work correctly.
+}
+</code></pre>
+
+<h3>内存分配</h3>
+<pre><code>pageinfo *
+mem_alloc(void)
+{
+    pageinfo *return_page;
+    if(!mem_freelist)
+        return NULL;
+    spinlock_acquire(mem_spinlock);
+    return_page = mem_freelist;
+    mem_freelist = mem_freelist-&gt;free_next;
+    spinlock_release(mem_spinlock);
+    return_page-&gt;free_next = NULL;
+    return return_page;
+}
+</code></pre>
+
+<h3>内存释放</h3>
+<pre><code>void
+mem_free(pageinfo *pi)
+{
+    assert(pi-&gt;refcount == 0);
+    spinlock_acquire(mem_spinlock);
+    pi-&gt;free_next = mem_freelist;
+    mem_freelist = pi;
+    spinlock_release(mem_spinlock);
+}
+</code></pre>
+
 
 </body>
 </html>
