@@ -294,9 +294,374 @@ img {
 <h1>进程与同步</h1>
 <hr />
 <h2>1. 多处理器的同步</h2>
+<p>PIOS是一个多处理器内核，因此需要同步机制来确保不同的物理内核能在不破坏内核数据结构的情况下同步运行。PIOS只使用了一个简单的同步概念：自旋锁。</p>
+<h3>自旋锁的基本功能</h3>
+<p>自旋锁数据结构</p>
+<pre><code>typedef struct spinlock {
+    uint32_t locked;    // Is the lock held?
+
+    // For debugging:
+    const char *file;   // Source file where spinlock_init() was called
+    int line;       // Line number of spinlock_init()
+    struct cpu *cpu;    // The cpu holding the lock.
+    uint32_t eips[DEBUG_TRACEFRAMES]; // Call stack that locked the lock.
+} spinlock;
+</code></pre>
+
+<p>在自旋锁的操作过程中需要使用汇编指令 xchg 来保证获取与释放自旋锁这两个动作的原子性。</p>
+<p>自旋锁初始化</p>
+<pre><code>void
+spinlock_init_(struct spinlock *lk, const char *file, int line)
+{
+    lk-&gt;file = file;
+    lk-&gt;line = line;
+    lk-&gt;cpu = NULL;
+    lk-&gt;locked = 0;
+}
+</code></pre>
+
+<p>获取自旋锁</p>
+<pre><code>void
+spinlock_acquire(struct spinlock *lk)
+{
+    if(spinlock_holding(lk))
+        panic(&quot;Has already held this spinlock!\n&quot;);
+    while(xchg(&amp;lk-&gt;locked, 1) != 0);
+    lk-&gt;cpu = cpu_cur();
+}
+</code></pre>
+
+<p>释放自旋锁</p>
+<pre><code>void
+spinlock_release(struct spinlock *lk)
+{
+    if(!spinlock_holding(lk))
+        panic(&quot;Doesn't hold the spinlock!\n&quot;);
+    lk-&gt;eips[0] = 0;
+    lk-&gt;cpu = NULL;
+    xchg(&amp;lk-&gt;locked, 0);
+}
+</code></pre>
+
+<p>当前CPU是否拥有该自旋锁</p>
+<pre><code>// Check whether this cpu is holding the lock.
+int
+spinlock_holding(spinlock *lock)
+{
+    return lock-&gt;locked &amp;&amp; lock-&gt;cpu == cpu_cur();
+}
+</code></pre>
+
 <h2>2. 进程的创建与调度</h2>
+<p>PIOS中的进程构造了一个严格的树状结构的进程层级， proc 结构体包含一个 parent 指针和最多256个 child 指针。</p>
+<pre><code>typedef struct proc {
+    // 保护进程状态的自旋锁.
+    spinlock    lock;
+
+    // 进程层级信息
+    struct proc *parent;
+    struct proc *child[PROC_CHILDREN];  //  PROC_CHILDREN = 256;
+
+    // 进程的调度信息
+    proc_state  state;      // 当前状态
+    struct proc *readynext; // 预备队列里的进程
+    struct cpu  *runcpu;    // 当前进程所在的CPU
+    struct proc *waitchild; // 等待的子进程
+
+    //保存用户可见信息的结构体
+    procstate   sv;
+} proc;
+</code></pre>
+
+<p>任一时刻，一个进程必然处于 proc 结构体里 state 域中的四个状态中的一种。</p>
+<pre><code>typedef enum proc_state {
+    PROC_STOP   = 0,    // 等待父进程的启动。
+    PROC_READY,     // 已经被父进程启动但是还没有在CPU中运行。调度器会将所有的 ready 状态下的进程放在一个准备队列中，
+                    //以便当CPU可用时将处于 ready 状态的进程换入CPU。
+    PROC_RUN,       // 正在CPU中运行。当进程处于这个状态时，proc 结构体的 runcpu 域指向的是当前进程所在的CPU。
+    PROC_WAIT,      // 进程正在等待一个子进程返回。
+} proc_state;
+</code></pre>
+
+<p>为进程 p 创建第 cn 个子进程 cp 的过程如下：</p>
+<pre><code>proc *
+proc_alloc(proc *p, uint32_t cn)
+{
+    pageinfo *pi = mem_alloc();     // 获取一页物理内存。
+    if (!pi)
+        return NULL;
+    mem_incref(pi);                 // 该页内存的引用 +1
+
+    proc *cp = (proc*)mem_pi2ptr(pi);   // 被创建的进程的 proc 结构体指针指向该内存地址。
+    memset(cp, 0, sizeof(proc));
+    spinlock_init(&amp;cp-&gt;lock);
+    cp-&gt;parent = p;                 // cp 的 parent 域指向 p。
+    cp-&gt;state = PROC_STOP;          // 新建进程的状态要置为 stop
+
+    // Integer register state
+    cp-&gt;sv.tf.ds = CPU_GDT_UDATA | 3;       // cp 为用户进程， 所以段寄存器的权限为 ring 3。
+    cp-&gt;sv.tf.es = CPU_GDT_UDATA | 3;
+    cp-&gt;sv.tf.cs = CPU_GDT_UCODE | 3;
+    cp-&gt;sv.tf.ss = CPU_GDT_UDATA | 3;
+    cp-&gt;sv.tf.eflags = FL_IF;
+    cp-&gt;pdir = pmap_newpdir();
+    cp-&gt;rpdir = pmap_newpdir();
+    if (p)                              // 若 p 为 null， 则表示 cp 为用户模式下的根进程。
+        p-&gt;child[cn] = cp;
+    return cp;
+}
+</code></pre>
+
+<h3>进程的调度与运行</h3>
+<p>进程的调度需要一个调度器来完成，一个简单实现的调度器可以将所有处于准备状态的进程放在一个队列中轮流运行。PIOS实现的调度器主要满足以下需求：</p>
+<ol>
+<li>调度器能在一个多处理器的系统里正常运行，比如，不会丢失进程或者破坏进程准备队列。</li>
+<li>不会让任何进程处于饥饿状态。</li>
+</ol>
+<p>第二点意味着，预备队列不能用栈结构实现。同时注意进程是运行在多处理器的环境里，为保证数据安全，需要合理使用自旋锁。</p>
+<p>进程的调度函数包括四个：</p>
+<ul>
+<li>
+<p>proc_ready 函数，将一个进程置于 ready 状态，并放入预备队列里。</p>
+<pre><code>void
+proc_ready(proc *p)
+{
+    assert(p-&gt;state != PROC_READY);
+    spinlock_acquire(&amp;p-&gt;lock);
+    p-&gt;state = PROC_READY;
+    p-&gt;readynext = NULL;
+    spinlock_release(&amp;p-&gt;lock);
+
+    spinlock_acquire(&amp;prq.lock);
+
+    if(prq.head == NULL || prq.tail == NULL){
+        prq.head = prq.tail = p;
+    }
+    else{
+        prq.tail-&gt;readynext = p;
+        prq.tail = p;
+    }
+
+    spinlock_release(&amp;prq.lock);
+}
+</code></pre>
+
+</li>
+<li>
+<p>proc_sched 函数，也就是一个调度器，从预备队列中取出并运行一个进程。</p>
+<pre><code>void gcc_noreturn
+proc_sched(void)
+{   
+    while(!prq.head){
+        sti();                  
+        pause();            // 当预备队列里没有进程是，开启中断，并使用 pause 等待。
+        cli();
+    }
+    spinlock_acquire(&amp;prq.lock);
+    proc *cur = prq.head;           // 从预备队列中取出一个处于 ready 状态的进程。
+    if(prq.head-&gt;readynext == NULL){
+        prq.head = prq.tail = NULL;
+    }
+    else{
+        prq.head = prq.head-&gt;readynext;
+    }
+    spinlock_release(&amp;prq.lock);
+    proc_run(cur);
+}
+</code></pre>
+
+</li>
+<li>
+<p>proc<em>run 函数， 将进程置于 run 状态。这个函数不会返回，而是调用 trap</em>return 进入用户模式并开始运行用户进程。</p>
+<pre><code>void gcc_noreturn
+proc_run(proc *p)
+{
+    spinlock_acquire(&amp;p-&gt;lock);
+    p-&gt;state = PROC_RUN;
+    p-&gt;runcpu = cpu_cur();
+    lcr3(mem_phys(p-&gt;pdir));        //加载将要运行进程的页目录，页目录的内容将在下一章分析。
+    spinlock_release(&amp;p-&gt;lock);
+    cpu_cur()-&gt;proc = p;
+    trap_return(&amp;p-&gt;sv.tf);
+}
+</code></pre>
+
+</li>
+<li>
+<p>proc_yield 函数，将当前运行的进程置于 ready 状态，并让出 CPU 给其他预备队列中的进程。</p>
+<pre><code>void gcc_noreturn
+proc_yield(trapframe *tf)
+{
+    proc_save(proc_cur(), tf, 1);   // 保存正在运行的进程的状态。
+    proc_ready(proc_cur());         // 将正在运行的进程置于 ready 状态。
+    proc_sched();
+}
+</code></pre>
+
+</li>
+</ul>
 <h2>3. 系统调用</h2>
+<p>现在，我们的内核已经可以创建和调度进程了，但是我们还需要给用户模式代码提供一个进入内核的方法。x86体系中，用户模式的进程可以通过软件中断（INT 指令）的 0x30 号向量（T_SYSCALL）显式的进入内核。</p>
+<p>用户模式通过 INT 指令进入内核模式的过程已经在上章详细介绍过了，下面主要将的就是 INT 指令的第 0x30 号向量，系统调用。</p>
+<h3>系统调用的进入、完成与重启</h3>
+<p><strong>进入系统调用：</strong> 当处理器遇到一个显式的 INT 指令时，它的行为和遇到如除零这样的异常类似，除了以下两方面：</p>
+<ul>
+<li>对于 INT 指令，处理器需要检查当前权限等级（CPL）与 IDT 中相应中断项的描述符权限等级（DPL）域。如果当前运行的代码没有足够的权限发起中断时，处理器会抛出异常。</li>
+<li>当处理器执行 INT 指令成功后，保存在栈里的用户模式 EIP 指向的是 INT 指令的下一条指令，而在异常里，保存的 EIP 指向的是导致异常的那条指令。</li>
+</ul>
+<p><strong>完成系统调用：</strong> 在内核处理一个系统调用时，在一些简单的情况里，内核完成了用户进程的请求，然后从进程离开用户模式的地方恢复用户代码的执行，这一切是通过调用 trap_return 完成的。</p>
+<p><strong>进程阻塞与重启系统调用：</strong> 在一些不那么简单的情况下，内核并不能立即完成系统调用，而是必须阻塞进程直到某些条件满足。在 PIOS 里，进程没用内核栈，一个被阻塞的进程必须要全部让出内核栈，以便下一个进程能正常使用。那么内核如何跟踪被阻塞进程的状态呢？我们可以在 proc 结构体里添加一个显式的状态来描述内核应该做些什么，但是跟踪这个复杂的状态是很困难的。另一个选择是将系统调用设计得具有原子性，就是说，系统调用要么完整地运行了，要么在改变任何用户可见的状态前阻塞，使用这种方式，如果一个进程需要阻塞并等待某些事件发生，一旦这个事件发生并唤醒该进程，进程只需要重启这个系统调用。这种设计里，只用用户模式寄存器的状态是重要的。</p>
+<p>PIOS 采用了第二种方法，系统重启。但实现重启模型时，必须要仔细思考，用户模式的 EIP 在系统调用正常完成的情况下指向哪，在阻塞的情况下又需要指向哪。</p>
+<h3>PIOS 系统调用的实现</h3>
+<p>PIOS 目前实现了四种系统调用</p>
+<ul>
+<li>
+<p>sys_cputs： 字符串打印。系统调用号保存在 %eax 里，参数保存在 %ebx 里。	static void</p>
+<pre><code>do_cputs(trapframe *tf, uint32_t cmd)
+{
+    // Print the string supplied by the user: pointer in EBX
+    char string[CPUTS_MAX + 1];
+    usercopy(tf, 0, string, tf-&gt;regs.ebx, CPUTS_MAX);
+    cprintf(&quot;%s&quot;, string);
+
+    trap_return(tf);    // syscall completed
+}
+</code></pre>
+
+</li>
+<li>
+<p>sys_put： 初始化调用进程的所有子进程，可以启动子进程与其并发运行。同时还包含以下功能：</p>
+<ul>
+<li>SYS_REG： 表示调用进程需要设置子进程的寄存器状态。出于权限安全的考虑，内核不能允许用户进程设置所有的寄存器状态。</li>
+<li>
+<p>SYS_START： 表示子进程需要开始运行。</p>
+<pre><code>static void
+do_put(trapframe *tf, uint32_t cmd){    
+    uint32_t flag = tf-&gt;regs.eax;
+    size_t size = tf-&gt;regs.ecx;
+    uint32_t source_add = tf-&gt;regs.esi;
+    uint32_t dest_add = tf-&gt;regs.edi;
+    proc* parent = proc_cur();
+    proc* child = parent-&gt;child[tf-&gt;regs.edx];
+    procstate *put_state = (procstate*)tf-&gt;regs.ebx;
+    if(!child){
+        child = proc_alloc(parent, tf-&gt;regs.edx);
+    }
+    if(child-&gt;state != PROC_STOP){
+        proc_wait(parent, child, tf);
+    }
+    if(tf-&gt;regs.eax &amp; SYS_REGS){
+        usercopy(tf, false, &amp;child-&gt;sv.tf, (uint32_t)(&amp;put_state-&gt;tf), sizeof(trapframe));
+        child-&gt;sv.tf.cs = CPU_GDT_UCODE | 3;
+        child-&gt;sv.tf.ds = CPU_GDT_UDATA | 3;
+        child-&gt;sv.tf.es = CPU_GDT_UDATA | 3;
+        child-&gt;sv.tf.ss = CPU_GDT_UDATA | 3;
+        child-&gt;sv.tf.eflags &amp;= FL_USER;
+        child-&gt;sv.tf.eflags |= FL_IF;
+        child-&gt;sv.tf.eip = put_state-&gt;tf.eip;
+        child-&gt;sv.tf.esp = put_state-&gt;tf.esp;
+    }
+
+    if(tf-&gt;regs.eax &amp; SYS_START){
+        proc_ready(child);
+    }
+    trap_return(tf);
+}
+</code></pre>
+
+</li>
+</ul>
+</li>
+<li>
+<p>sys_get： 收集子进程的信息，更多的功能有：</p>
+<ul>
+<li>
+<p>SYS_REGS:表示调用进程需要收集子进程的寄存器信息。</p>
+<pre><code>static void
+do_get(trapframe *tf, uint32_t cmd){
+    uint32_t flag = tf-&gt;regs.eax;
+    size_t size = tf-&gt;regs.ecx;
+    uint32_t source_add = tf-&gt;regs.esi;
+    uint32_t dest_add = tf-&gt;regs.edi;
+    proc* parent = proc_cur();
+    proc* child = parent-&gt;child[tf-&gt;regs.edx];
+    procstate *get_state = (procstate*)tf-&gt;regs.ebx;
+    if(!child)
+        child = &amp;proc_null;
+    /*assert(size%PTSIZE == 0);
+    assert(((uint32_t)source_add)%PTSIZE == 0);
+    assert(((uint32_t)dest_add)%PTSIZE == 0);
+    */
+    if(child-&gt;state != PROC_STOP){
+        proc_wait(parent, child, tf);
+    }
+    if(flag&amp; SYS_REGS){
+        usercopy(tf, 1, &amp;child-&gt;sv.tf, (uint32_t)(&amp;get_state-&gt;tf), sizeof(trapframe));
+    }
+    trap_return(tf);
+}
+</code></pre>
+
+</li>
+</ul>
+</li>
+<li>
+<p>sys_ret：显式的从子进程返回到父进程。子进程进入 stop 状态，若父进程在等待这个子进程，唤醒父进程。</p>
+<pre><code>static void
+do_ret(trapframe *tf){
+    proc_ret(tf, 1);
+}
+</code></pre>
+
+</li>
+</ul>
 <h2>4. 抢占与陷阱反射</h2>
+<h3>抢占</h3>
+<p>如果一个进程执行的时间过长，我们就需要从它手里夺回CPU资源，分发给其他进程。</p>
+<p>为了实现抢占，我们需要安排一个<strong>异步计时器中断</strong>定期的发送个每个CPU，通过这个中断，处理器将控制权转交给内核，然后内核再进行控制权的调度。在多内核 x86 系统中，每个cpu有一个<strong>本地高级可编程中断控制器</strong>（LAPIC），可以用来生成这种中断。处理器可以通过设置 EFLAGS 寄存器里的 IF 位来控制是否忽略这个中断。一旦中断被激活，计时器中断会被送往 T_LTIMER 向量。作为结果，当前运行的进程被放进预备队列，并从预备队列中选择一个进程运行。</p>
+<pre><code>void gcc_noreturn
+trap(trapframe *tf)
+{
+    asm volatile(&quot;cld&quot; ::: &quot;cc&quot;);
+
+    proc *p = proc_cur();
+    switch (tf-&gt;trapno) {
+
+        ...
+
+    case T_LTIMER: ;
+        lapic_eoi();    //  陷阱已被获取，通知硬件设备清除中断。
+        if (tf-&gt;cs &amp; 3) // 当前进程必须处在用户模式下
+            proc_yield(tf);
+        trap_return(tf);    // 否则，空循环。
+
+        ...
+    }
+
+    ...
+
+}
+</code></pre>
+
+<p>当内核收到一个异步的硬件中断时，就要给产生中断的硬件发送一个信号，通知其中断处理已经完成，否则，中断源会让中断请求一直处于生效状态，只要 IF 位被激活，就会立即给处理器再次发送中断。这个“中断清除”过程通常被称作 EOI ，即中断结束（End Of Interrupt）。</p>
+<h3>中断反射</h3>
+<p>前面，系统调用 sys_ret 给了一个进程显式的返回父进程的方式，但进程同样可以因为触发任何处理器定义的异常隐式地返回到父进程，例如除零、通用保护错误等。</p>
+<p>无论何时，一个进程在用户模式触发了一个异常，同时 PIOS 内核也没有自动处理，内核就会将这个陷阱以隐式返回的模式反射给父进程：进程进入 stop 状态，被动地等待父进程通过 sys<em>get 来收集它的状态。陷阱帧里的 tf</em>trapno 会告诉我们该进程触发了哪个陷阱， tf_eip 则指向导致陷阱的指令。这个反射功能给用户模式进程提供了监管子进程的能力，可以通过合理的方式来处理其子进程触发的陷阱。当然内核不能反射由根进程触发的陷阱，因为根进程没有父进程 ╮(╯▽╰)╭</p>
+<pre><code>void gcc_noreturn
+trap(trapframe *tf)
+{
+    ...
+    switch (tf-&gt;trapno) {
+        ...
+
+        proc_ret(tf, -1); // 将陷阱反射给父进程。
+
+        ...
+
+    }
+}
+</code></pre>
+
 
 </body>
 </html>
