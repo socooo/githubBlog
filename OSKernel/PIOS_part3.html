@@ -293,8 +293,308 @@ img {
 <body>
 <h1>虚拟内存</h1>
 <hr />
+<p>这一章讲解 PIOS 的分页虚拟内存管理。我们会使用 x86 的基于页的地址转换功能给每个进程一个用户级地址空间，分析保护功能剩余的关键部分 -- 阻止进程存取其他进程或内核的地址空间。</p>
 <h2>1. 页表的管理</h2>
+<h3>设置内核的地址空间</h3>
+<p>x86 处理器的分页机制一旦被激活，那么无论处理器运行什么代码，包括内核代码，存取物理内存或 I/O 设备的唯一方法就是通过分页内存管理系统。这意味着要使用分页内存管理，内核必须先要初始化至少一个<strong>页目录/页表</strong>结构体并且在激活分页前将其加载到处理器中。</p>
+<p>在 PIOS 里，内核在虚拟地址上存取物理内存和 I/O 设备时应该与它的物理地址一致。因此，需要在激活分页前为内核创建一套恒等映射，让一个虚拟地址映射到与该虚拟地址相同的物理地址上。</p>
+<pre><code>void
+pmap_init(void)
+{
+    if (cpu_onboot()) {
+
+        int i = 0;
+        int userlo_d = VM_USERLO &gt;&gt; PDXSHIFT;       // userlo_d &lt;= 用户进程使用的地址 &lt; userhi_d 
+        int userhi_d = VM_USERHI &gt;&gt; PDXSHIFT;
+        // 为内核创建恒等映射。
+        for(i; i&lt;userlo_d; i++){
+            pmap_bootpdir[i] = i &lt;&lt; PDXSHIFT | PTE_P | PTE_PS | PTE_G | PTE_W;
+        }   
+        // 用户模式的地址空间初始化为常量 PTE_ZERO
+        // PTE_ZERO 不同于 NULL，它指向一个特定页的物理地址，内核会保证这个页的内容永久为 0。
+        // 这样做是为了更好的控制页的权限。
+        for(i; i&lt;userhi_d; i++){
+            pmap_bootpdir[i] = PTE_ZERO;
+        }
+        // 为内核创建恒等映射。
+        for(i; i &lt; NPDENTRIES; i++){
+            pmap_bootpdir[i] = i &lt;&lt; PDXSHIFT| PTE_P | PTE_PS | PTE_G | PTE_W;
+        }
+    }
+
+    // 激活 4MB 页与全局页。
+    uint32_t cr4 = rcr4();
+    cr4 |= CR4_PSE | CR4_PGE;
+    lcr4(cr4);
+
+    // 将引导页目录 pmap_bootpdir 加载到PDBR（页目录基址寄存器，即 cr3）。
+    lcr3(mem_phys(pmap_bootpdir));
+
+    // 开启分页。
+    uint32_t cr0 = rcr0();
+    cr0 |= CR0_PE|CR0_PG|CR0_AM|CR0_WP|CR0_NE|CR0_TS|CR0_MP|CR0_TS;
+    cr0 &amp;= ~(CR0_EM);
+    lcr0(cr0);
+}
+</code></pre>
+
+<h3>进程间的页目录</h3>
+<p>激活了分页机制以后，就需要构建一个映射结构给用户进程提供独立的地址空间。x86 的32位分页系统使用一个两级映射结构：一个页目录代表整个32位地址空间，包含 2^10(1024)个页目录项，每个页目录项指向一个页表的起始地址。一个页表包含了一个 4MB (2^22 byte)地址空间的映射，拥有 2^10（1024）个页表项，每个页表项指向一个页的起始地址。</p>
+<pre><code>typedef struct proc {
+    spinlock    lock;
+    struct proc *parent;
+    struct proc *child[PROC_CHILDREN];
+
+    ...
+
+    // 进程的虚拟内存状态。
+    pde_t       *pdir;      // 工作页目录。
+    pde_t       *rpdir;     // 引用页目录。
+
+    ...
+
+} proc;
+</code></pre>
+
+<p>在 PIOS 中，每个进程都有两个页目录：一个工作页目录和一个引用页目录。工作页目录在内核执行该进程是被加载到处理器中，引用页目录的作用会在文件系统里介绍。创建一个新进程时，两个页目录会被初始化为 pmap_bootpdir 的拷贝。</p>
+<pre><code>proc *
+proc_alloc(proc *p, uint32_t cn)
+{
+    ...
+
+    cp-&gt;pdir = pmap_newpdir();      // 为进程创建一个工作页目录。
+    cp-&gt;rpdir = pmap_newpdir();     // 为进程创建一个引用页目录。
+
+    ...
+
+}
+
+
+pte_t *
+pmap_newpdir(void)
+{
+    pageinfo *pi = mem_alloc();
+    if (pi == NULL)
+        return NULL;
+    mem_incref(pi);
+    pte_t *pdir = mem_pi2ptr(pi);
+
+    // 将引导页目录 pmap_bootpdir 的内容拷贝给新页表。
+    assert(sizeof(pmap_bootpdir) == PAGESIZE);
+    memmove(pdir, pmap_bootpdir, PAGESIZE);
+
+    return pdir;
+}
+</code></pre>
+
+<h3>页表管理</h3>
+<p>页表的管理代码包含以下三个函数：</p>
+<ul>
+<li>
+<p>pmap_walk（pde_t * pdir，uint32_t va，bool writing）： 查询两级页表，并按内核的需求分配一个页表。这个函数的目的是定位一个页表项（PTE），这个页表项包含了要找的虚拟地址 va。</p>
+<p>由于内核将一个新的页目录的所有页目录项初始化为 PTE_ZERO，所以一个新的页目录没有相关的页表。内核是在第一次映射某个地址时才会初始化并分配一个页表给相应的页目录项，这也是 pmap_walk 的一个次要任务。</p>
+<p>pmap_walk（）里有 writing 参数，用来指明调用者是“读取”还是“写入”分页结构。如果写入为零（false），并且pmap_walk（）遇到缺少的页表，它只返回NULL，并假设调用者将知道如何继续。如果写入非零（true），那么pmap_walk（）将尝试通过分配和初始化新的页表来“填写”缺少的PDE，只有在mem_alloc（）失败时才返回NULL。当pmap_walk（）分配并将新页表插入到页目录中时，它会将新页表中的所有PTE初始化为PTE_ZERO，但将页表自身插入到页目录中，并设置相应的权限允许处理器在用户或内核模式下读或写新的页表。</p>
+<pre><code>pte_t *
+pmap_walk(pde_t *pdir, uint32_t va, bool writing)
+{
+    assert(va &gt;= VM_USERLO &amp;&amp; va &lt; VM_USERHI);
+    uint32_t pde_i = PDX(va);
+    uint32_t pte_i = PTX(va);
+    if(pdir[pde_i] == PTE_ZERO){
+        if(!writing)
+            return NULL;
+        pageinfo* page = mem_alloc();
+        if(!page)
+            return NULL;
+        mem_incref(page);
+        // 为页表项(PTE)设置权限。
+        pdir[pde_i] = mem_pi2phys(page) | PTE_P | PTE_U | PTE_W | PTE_A;
+        int i;
+        pte_t* ptable = (pte_t*)PGADDR(pdir[pde_i]);
+        for(i = 0; i&lt;NPTENTRIES; i++){
+            ptable[i] = PTE_ZERO;
+        }
+        pte_t* pte_ret = (pte_t*) (&amp;(ptable[pte_i]));
+        return pte_ret;
+    }
+    pte_t* pt_has_ret = (pte_t*) (PGADDR(pdir[pde_i]));
+    pte_t* pte_ret = (pte_t*) (&amp;(pt_has_ret[pte_i]));
+    return pte_ret;
+}
+</code></pre>
+
+</li>
+<li>
+<p>pmap_insert(pde_t *pdir, pageinfo *pi, uint32_t va, int perm)：传入一个指向给定物理页面的 pageinfo 结构的指针，该函数将该页面映射到虚拟地址 va 上，并为 PTE 设置权限 perm 。如果另一个页面已经映射到相同的虚拟地址，则此功能首先会取消旧的映射。</p>
+<p>解映射和映射过程都会适当地在pageinfo结构中调整相关联的物理页面的引用计数（pageinfo-&gt;refcount）：增加正在映射的页面的引用计数，并且减少任何未映射的页面的引用计数。如果取消映射后旧页面的引用计数变为0，那么旧页面必须被释放。我们在kern / mem.c中提供了mem_incref（）和mem_decref（）函数，以原子方式增加和减少每页引用计数：这意味着，在多处理器环境中，不必使用自旋锁来维护引用计数的一致性。 mem_decref（）函数在引用计数达到零时也自动调用mem_free（）：这意味着在调用mem_decref（）时，您必须真正完成了该页面的使用，因为另一个处理器可能立即分配并使用这个页面。</p>
+<pre><code>pte_t *
+pmap_insert(pde_t *pdir, pageinfo *pi, uint32_t va, int perm)
+{
+    uint32_t pte_i = PTX(va);
+    uint32_t pde_i = PDX(va);
+    pte_t* pt_base = (pte_t *)PGADDR(pdir[pde_i]);  // PGADDR 会将页表项中的记录的最后三位置零，因为最后三位是权限位。
+    uint32_t pte = mem_pi2phys(pi) | perm | PTE_P;
+    if((pt_base[pte_i] &amp; 0xfffff000) == (pte &amp; 0xfffff000)){    // 页表项记录的最后三位置零才是给页表项指向的地址。
+        pt_base[pte_i] = (pte_t)pte;
+        pmap_inval(pdir, va, PAGESIZE);
+        return (pte_t*)(&amp;(pt_base[pte_i]));
+    }
+    if((PGADDR(pdir[pde_i]) != PTE_ZERO) &amp;&amp; (PGADDR(pt_base[pte_i]) != PTE_ZERO)){
+        pmap_remove(pdir, PGADDR(va), PAGESIZE);
+    }
+    pte_t* pte_add = pmap_walk(pdir, va, 1);
+    if(!pte_add)
+        return NULL;
+    pte_add[0] = pte;
+    mem_incref(pi);
+    return (pte_t*)(pte_add);
+}
+</code></pre>
+
+</li>
+<li>
+<p>void pmap_remove（pde_t * pdir，uint32_t va，size_t size）：该函数从虚拟地址空间中删除任意连续的页面映射范围，从va（必须是页对齐）开始，并覆盖 size 大小的地址区域（同样必须是PAGESIZE的倍数）。上述两种功能一次只处理4KB的页面映射，与其不同，该函数会遍历虚拟地址空间，可能会删除该进程中的许多页面映射。此外，如果要删除的地址区域覆盖由一个或多个页表表示的整个4MB区域，则pmap_remove（）不仅会删除那些页表中的所有映射，而且还会在页目录中解映射并释放该页表。</p>
+<p>与pmap_insert（）一样，此函数减少所有解映射页面的引用计数，并释放掉引用计数为0的页面。解映射的页表项目处于与新分配的页表中的PTE初始化为相同的状态，即：设置为PTE_ZERO。</p>
+<pre><code>void
+pmap_remove(pde_t *pdir, uint32_t va, size_t size)
+{
+    assert(PGOFF(size) == 0);   // must be page-aligned
+    assert(va &gt;= VM_USERLO &amp;&amp; va &lt; VM_USERHI);
+    assert(size &lt;= VM_USERHI - va);
+
+    uint32_t pde_i = PDX(va);
+    uint32_t pte_i = PTX(va);
+    int page_account = size/PAGESIZE;
+    int remove_pde_no = (page_account+pte_i) / NPTENTRIES;
+    int i = 0;
+    for(i; i &lt; page_account; i++){
+        pte_t* pt_base = (pte_t*)PGADDR(pdir[pde_i + i/NPDENTRIES]);
+        if((PGADDR(pdir[pde_i + i/NPDENTRIES]) != PTE_ZERO) &amp;&amp; (PGADDR(pt_base[(pte_i + i) % NPTENTRIES]) != PTE_ZERO)){
+            pageinfo* pi = (pageinfo*)mem_phys2pi(PGADDR(pt_base[(pte_i + i)%NPTENTRIES]));
+            if(pi){
+                mem_decref(pi, mem_free);
+                pt_base[(pte_i+i)%NPTENTRIES] = PTE_ZERO;
+                pmap_inval(pdir, va, PAGESIZE);     // 刷新 TLB
+            }
+        }
+    }
+    if(remove_pde_no &gt; 0){      //  当删除的区域覆盖了 4MB 内容，则要在页目录中删除该页表。
+        for(i = 1; i &lt;= remove_pde_no; i++){
+            if(i == 1){
+                if(pte_i == 0){
+                    if(pdir[pde_i] != PTE_ZERO){
+                        mem_decref((pageinfo *)mem_phys2pi(PGADDR(pdir[pde_i])), mem_free);
+                        pdir[pde_i] = PTE_ZERO;
+                    }
+                }
+            }else{
+                if(pdir[pde_i + i -1] != PTE_ZERO){
+                    mem_decref((pageinfo *)mem_phys2pi(PGADDR(pdir[pde_i + i -1])), mem_free);
+                    pdir[pde_i + i -1] = PTE_ZERO;
+                }
+            }
+        }
+    }
+}
+</code></pre>
+
+</li>
+</ul>
+<p>由于pmap_insert（）和pmap_remove（）都可以影响处理器已经使用并加载到处理器的翻译后备缓冲区（TLB）中的页面映射，所以如果被修改的地址空间是当前正在运行的进程的地址空间，这些函数还要确保所有受影响的映射都从TLB刷新。</p>
+<p>在大多数多处理器操作系统中，像pmap_insert（）和pmap_remove（）这样的操作可能不仅要刷新当前处理器的 TLB，而且还要刷新其他同时运行的处理器的 TLB。此过程称为 TLB shootdown。</p>
 <h2>2. ELF可执行文件的加载与运行</h2>
+<p>有了设置分页结构的代码后，就可以建立一些分页结构了：在用户地址空间中运行用户模式的“root”进程需要的分页结构，以及从内核链接的可执行映像所需的分页结构。我们提供了一个测试程序user / testvm.c，它们对虚拟内存系统进行了运行和测试，但是您需要将该可执行文件加载到根进程的地址空间中并开始运行。</p>
+<p>在探索 xv6 和 PIOS 的引导进程时，已经遇到可执行和可链接格式（ELF）文件：boot / main.c 中的引导加载（bootloader）程序代码已将内核从ELF可执行文件加载到物理内存中。</p>
+<p>引导加载内核的程序（bootloader）和内核代码现在需要做的的主要区别是：</p>
+<ul>
+<li>
+<p>物理内存是实际存在的，只需要等待引导加载程序（bootloader）加载某些东西，但 root 进程最初在用户地址空间区域中根本没有加载该程序所需的可访问的内存。在加载程序时，内核必须分配物理页面并将其映射到用户虚拟内存区域。</p>
+</li>
+<li>
+<p>ELF可执行文件可以包含多个段，这些段旨在区分不同的内存访问权限：例如，代码和常量字符串是只读的，对初始化和未初始化数据（bss）是可读可写的。ELF程序头（proghdr）结构的p_flags成员中的标志标识了如何映射一个段。引导加载程序会忽略这些标志，因为没有办法为物理内存分配访问权限。而在第一个用户进程被加载到虚拟内存中时，内核可以并且应该正确设置其内存权限。</p>
+</li>
+<li>
+<p>引导加载程序仅加载由ELF程序头中的p_filesz表示的每个程序段的初始化部分：即包含在ELF文件中的程序段的部分。任何程序段还可以包含一个未初始化的部分，高于p_filesz，但低于Program Header的p_memsz成员指示的内存中段大小。ELF程序加载器应当映射这个未初始化的数据区，但将其内容设置为零。 PIOS的引导加载程序忽略了这个职责，而是让内核自己做到这一点：这就是在kern / init.c开始时 memset（edata，0，end-edata）所做的事情。</p>
+</li>
+</ul>
+<p>ELF头除了描述要加载到存储器中的段，还要指示程序应该开始执行的位置：即程序中第一条指令的用户级别的EIP。除了通过ELF映像描述的方式加载程序本身，内核还需要给根进程创建一个栈。一个一页大小的栈就足够;如果需要的话，根进程可以为自己分配一个更大的栈。用户虚拟内存区域的高端（VM_USERHI之前的最后一页）是根进程栈的合适位置。</p>
+<pre><code>proc_root= proc_alloc(NULL, 0);
+load_elf(ROOTEXE_START,proc_root);      // 调用加载根进程的函数
+proc_root-&gt;sv.tf.fs = CPU_GDT_UDATA | 3;
+proc_root-&gt;sv.tf.gs = CPU_GDT_UDATA | 3;    
+proc_root-&gt;sv.tf.eip = (uint32_t)(0x40000100);
+proc_root-&gt;sv.tf.esp = (uint32_t)(VM_USERHI -1);    // esp 指向用户虚拟内存区域的高端，用作根进程的栈。
+proc_root-&gt;sv.tf.eflags = FL_IF;
+proc_ready(proc_root);
+proc_sched();
+</code></pre>
+
+<hr />
+<pre><code>void load_elf(char* elf, proc* p){
+    uint32_t va, p_va_start, p_va_end;
+    proghdr* phd;
+    int i, j;
+    pte_t* pte;
+    elfhdr* elf_load = (elfhdr*)elf;
+    phd = (proghdr*)(elf + elf_load-&gt;e_phoff);
+
+    for(i = 0; i &lt; elf_load-&gt;e_phnum; i++){     // 按 program 加载 ELF 文件。
+        if(phd-&gt;p_type != 1){
+            phd++;
+            continue;
+        }
+        p_va_start = phd-&gt;p_va &amp; (~0xfff);  //  程序文件头的 p_va 字段指出该程序要被加载在哪个地址上。
+        p_va_end = (p_va_start + phd-&gt;p_memsz - 1) &amp; ~0xfff;
+        for(va = p_va_start; va &lt;= p_va_end; va+=PAGESIZE){     // 为当前程序分配物理内存，并映射到虚拟地址上。
+            if(pmap_insert(p-&gt;pdir, mem_alloc(), va, PTE_P | PTE_W | PTE_U) == NULL){
+                panic(&quot;no mem in load_elf.\n&quot;);
+            };
+        }
+        phd++;
+    }
+
+    phd = (proghdr*)(elf + elf_load-&gt;e_phoff);
+    for(i = 0; i &lt; elf_load-&gt;e_phnum; i++){
+        if(phd-&gt;p_type != 1){
+            phd++;
+            continue;
+        }
+
+        char* load_va_start = (char*)phd-&gt;p_va;
+        char* load_start = elf + phd-&gt;p_offset;
+        for(j = 0; j &lt; phd-&gt;p_filesz; j++){     // 将 ELF 程序的内容拷贝到内存里。
+            *(load_va_start + j) = *(load_start + j);
+        }
+        if(phd-&gt;p_memsz &gt; phd-&gt;p_filesz){
+            for(j; j &lt; phd-&gt;p_memsz; j++)
+                *(load_va_start + j) = 0;       // 未初始化变量等所在的区域初始化为0.
+        }
+        phd++;
+    }
+
+    phd = (proghdr*)(elf + elf_load-&gt;e_phoff);
+    for(i = 0; i &lt; elf_load-&gt;e_phnum; i++){
+        if(phd-&gt;p_type != 1){
+            phd++;
+            continue;
+        }
+        if(phd-&gt;p_flags &amp; ELF_PROG_FLAG_WRITE){
+            phd++;
+            continue;
+        }
+        p_va_start = phd-&gt;p_va &amp; (~0xfff);
+        p_va_end = (p_va_start + phd-&gt;p_memsz - 1) &amp; ~0xfff;
+        for(va = p_va_start; va &lt;= p_va_end; va+=PAGESIZE){     //  为只读区域设置只读权限。
+            pte = pmap_walk(p-&gt;pdir,va,1);
+            *pte = *pte &amp; (~PTE_W);
+        }
+    }
+
+    if(pmap_insert(p-&gt;pdir, mem_alloc(), rootexe_stack_addr,SYS_RW| PTE_U | PTE_P | PTE_W) == NULL)     // 为进程栈分配一个物理页并映射到虚拟地址上，其权限为可读写。
+        panic(&quot;Has no mem in load_elf assign stack.\n&quot;);
+}
+</code></pre>
+
 <h2>3. 用户模式下的拷贝</h2>
 <h2>4. 使用写时拷贝模式的内存管理</h2>
 <h2>5. 合并虚拟内存</h2>
