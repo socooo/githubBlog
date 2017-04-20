@@ -385,6 +385,19 @@ pmap_newpdir(void)
 
     return pdir;
 }
+
+
+void gcc_noreturn
+proc_run(proc *p)
+{
+    spinlock_acquire(&amp;p-&gt;lock);
+    p-&gt;state = PROC_RUN;
+    p-&gt;runcpu = cpu_cur();
+    lcr3(mem_phys(p-&gt;pdir));            // 进程切换时需要手动加载该进程的页目录
+    spinlock_release(&amp;p-&gt;lock);
+    cpu_cur()-&gt;proc = p;
+    trap_return(&amp;p-&gt;sv.tf);
+}
 </code></pre>
 
 <h3>页表管理</h3>
@@ -596,8 +609,399 @@ proc_sched();
 </code></pre>
 
 <h2>3. 用户模式下的拷贝</h2>
+<p>虚拟内存可以让我们保护内核的状态不受用户级进程的影响，并且也能保护进程彼此之间不会受到影响。我们需要重新考虑内核在系统调用期间如何与用户级代码进行交互。系统调用通常有参数，需要从用户空间传递到内核。 PIOS 系统调用在寄存器中传递简单的参数：lib / syscall.c 中的用户模式系统调用只需在执行INT T_SYSCALL指令之前将参数加载到相应的寄存器中，而 kern / syscall.c 中的内核系统调用处理代码从用户陷阱帧中获取这些参数。</p>
+<p>许多系统调用使用了不适合寄存器的参数，比如，sys_cputs 的字符串参数以及 sys_put 和sys_get 里指向 CPUstatus 的指针。对于这样的参数，PIOS 的用户空间里的系统调用只是将参数数据留在用户空间中，给寄存器中传递一个指向这些数据的指针。内核需要从用户空间读取这些参数数据，或者将系统调用结果写入用户空间。如果用户代码传递的是一个无效的指针会怎么样？考虑在系统调用的处理过程中发生以下情况时，会发生什么事：</p>
+<ul>
+<li>
+<p>指针指向用户空间（VM_USERLO和VM_USERHI之间）以外的区域 。</p>
+</li>
+<li>
+<p>给用户空间传递一个指向还未映射的虚拟地址的指针（无访问权限）。</p>
+</li>
+<li>
+<p>给具有写操作的系统调用传递一个指向用户空间的数据区域的指针，例如 sys_get 的 cpustate 参数，但该数据区的一部分或全部已经被映射为只读。</p>
+</li>
+</ul>
+<h3>保护 PIOS 系统调用</h3>
+<p>为了解决 PIOS 里这样的安全漏洞，我们需要做两件事情：</p>
+<ul>
+<li>
+<p>每当内核要访问由用户指定并应该指向用户空间的内存区域时，内核必须仔细验证用户指定的整个数据区确实位于用户的地址空间（VM_USERLO和VM_USERHI之间）。</p>
+<pre><code>static void checkva(trapframe *utf, uint32_t uva, size_t size)
+{
+    if(uva &lt; VM_USERLO || uva &gt;= VM_USERHI || uva + size &gt; VM_USERHI){
+        systrap(utf, T_PGFLT, 0);
+    }
+}
+
+static void gcc_noreturn
+systrap(trapframe *utf, int trapno, int err)
+{
+    utf-&gt;trapno = trapno;
+    utf-&gt;err = err;
+    proc_ret(utf, 0);
+}
+</code></pre>
+
+</li>
+<li>
+<p>此外，内核必须预期用户进程可能会将一个指向非法地址的指针传递进来。在这种情况下，处理器在内核中运行时会收到一个陷阱，内核必须清楚这个陷阱是属于用户空间，还是内核空间。</p>
+</li>
+</ul>
+<p>在系统调用的处理过程中，PIOS 遇到由用户引起的内存访问错误时，处理方式与 INT T_SYSCALL 指令本身引起了内存错误时处理方式一致，例如，如果用户发出一个SYS_GET系统调用，要求内核将一个 cpustate 结构写入一个无效或未映射的地址，那么用户进程将会收到一个页错误，如同它直接执行了尝试写入到非法地址的MOV指令一样。这种在系统调用期间处理存储器访问故障的方法只是 PIOS 的方法：同样的情况下，Unix 系统更常见的做法是让系统调用返回带有诸如EFAULT的错误代码。</p>
 <h2>4. 使用写时拷贝模式的内存管理</h2>
+<p>我们在完全虚拟的地址空间中创建了一个根进程，并采取了适当的措施来保护内核;现在需要实现的是用户进程更改自己的虚拟地址空间，为其子进程设置虚拟地址空间以及与其子进程进行通信的方法。我们不会添加更多的系统调用，而是扩展现有的 GET 和 PUT 系统调用，让调用者能够执行内存管理操作。进程可以通过这样的方式将几个相关操作组合成一个GET或PUT系统调用以提高效率：例如，父进程可以通过一个 PUT 系统调用设置子进程的寄存器状态，并启动运行一个子进程，之后通过一个GET系统调用可以与子进程同步，获取子进程的寄存器状态，并从虚拟地址空间获取一些运行结果。该过程通过设置以下值来进行操作：</p>
+<ul>
+<li>
+<p>SYS_MEMOP中的内存操作代码的位字段。必须是以下值之一：</p>
+<ul>
+<li>
+<p>SYS_ZERO：从目标进程中的一系列虚拟内存中删除所有权限，并将该虚拟内存范围的内容全部替换为零。该操作有效地将给定的存储器范围恢复到进程创建时的“原始”状态。</p>
+</li>
+<li>
+<p>SYS_COPY：将源进程（PUT中的父进程，GET中的子进程）的虚拟内存范围复制到目标进程（PUT中的子进程，GET中的父进程）。为了提高效率，内核最初只复制内存映射，使所有受影响的映射都是只读的，然后只有在用户代码尝试写入复制的页时才根据需要复制实际的页内容。</p>
+</li>
+<li>
+<p>SYS_MERGE（仅适用于GET）：对于给定的虚拟地址，将子进程里与快照不同的地方拷贝到父进程当中。相关内容会在最后一节讲解。</p>
+</li>
+</ul>
+<p>为了简单起见，所有这些存储器操作中，被操作的内存必须从4MB边界上开始，并且大小必须为4MB的倍数。</p>
+<p>在进入GET / PUT系统调用时，用户代码在以下寄存器中指定相关的内存范围：</p>
+<ul>
+<li>
+<p>ECX：保存内存区域大小。必须是4MB的倍数。</p>
+</li>
+<li>
+<p>ESI：保存相关进程来源区域（GET的子进程，PUT的父进程）的开始地址。必须是4MB的倍数。</p>
+</li>
+<li>
+<p>EDI：保存相关进程目标区域（GET的父进程，PUT的子进程）的开始地址。必须是4MB的倍数。</p>
+<pre><code>switch(flag &amp; SYS_MEMOP){
+    case SYS_ZERO:
+        assert(size%PTSIZE == 0);
+        assert((dest_add)%PTSIZE == 0);
+        checkva(tf, dest_add, size);
+        pmap_remove(child-&gt;pdir, dest_add, size);
+        break;
+    case SYS_COPY:
+
+        ...
+
+        if(!pmap_copy(parent-&gt;pdir, source_add, child-&gt;pdir, dest_add, size))   // 对目标区域进行虚拟拷贝（写时拷贝）
+            panic(&quot;pmap_copy does not finished.\n&quot;);
+        break;
+    default:
+        break;
+    }
+</code></pre>
+
+</li>
+</ul>
+</li>
+<li>
+<p>SYS_PERM：如果调用进程将该标志设为1，则在执行完 SYS_MEMOP 指定的存储器操作后，内核将为目标内存里的所有页设置权限，权限由 SYS_READ 和 SYS_WRITE 位标出：</p>
+<ul>
+<li>
+<p>只有SYS_PERM：GET / PUT将从目标内存区域中的所有页中删除所有访问权限。这种删除访问不会释放目标内存区域的内容或者归零目标内存区域的内容：实际页面内容与虚拟地址空间中的相关位置保持关联，只是暂时“隐藏”并且不可访问。随后的SYS_PERM操作可以恢复对不可访问页面的访问权限。只有上面的SYS_ZERO操作清除了权限和页面内容。</p>
+</li>
+<li>
+<p>SYS_PERM | SYS_READ：设置目标区域中所有页上的权限，以允许只读访问，而不管这些页的先前权限。如果调用者对未从未使用过的内存区域，或者被填充了 PTE_ZERO 的内存区域执行此操作，则这些页能以只读方式访问。</p>
+</li>
+<li>
+<p>SYS_PERM | SYS_READ | SYS_WRITE：设置目标区域中所有页面的权限，以允许读取和写入权限，无论这些页之前的权限是什么。如果调用者在从未使用过的目标内存区域或被设置为SYS_ZERO的页上执行此操作，则这些页最初虽然被设为零，但可被读取/写入，因此可能被作为“新分配“的虚拟内存使用，相当于Unix或xv6中的sbrk（）。</p>
+<pre><code>switch(flag &amp; 0x700){
+case SYS_PERM:
+    pmap_setperm(child-&gt;pdir, dest_add, size, 0);
+    break;
+case SYS_PERM | SYS_READ:
+    pmap_setperm(child-&gt;pdir, dest_add, size,SYS_READ);
+    break;
+case SYS_PERM | SYS_READ | SYS_WRITE:
+    pmap_setperm(child-&gt;pdir, dest_add, size, SYS_RW);
+    break;
+default:
+    break;
+}
+</code></pre>
+
+</li>
+</ul>
+</li>
+<li>
+<p>SYS_SNAP（仅适用于PUT）：如果在PUT系统调用中将此标志设为1，则在执行上述指定的内存操作和/或权限更改后，内核将该子进程的整个工作地址空间复制到子进程的参考地址空间中（由 proc-&gt; rpdir 表示）。这个标志在最后一节进一步讨论。</p>
+</li>
+</ul>
+<h3>写时复制与名义和实际页权限</h3>
+<p>当内核根据SYS_COPY或SYS_SNAP操作的要求执行“批量”虚拟的地址空间复制时，它会使用写时拷贝，当内核执行虚拟拷贝时，对于每个“拷贝”页，内核只是做了：</p>
+<ol>
+<li>
+<p>复制页面映射而不是页本身，源地址和目标地址实际上映射到内存中相同的物理页。</p>
+</li>
+<li>
+<p>增加每个以这种方式共享的页上的引用计数，以跟踪每个页上存在的引用数量。</p>
+</li>
+<li>
+<p>将源和目标映射设置为只读，以防止任一进程直接修改共享页。</p>
+</li>
+</ol>
+<p>进程会尝试写入一个可写的页，但是由于内核的写时拷贝优化，现在这个页是只读的，此时会产生一个页错误，内核需要处理这个页错误，处理的过程需要对进程透明。具体来说，内核分配一个新页，将共享页的内容拷贝到这个新页中，将映射从旧的共享页重定向到这个新的专享页上，并相应地更新页的引用计数（释放一个旧的共享页的引用计数，并在新页中添加一个）。由于新页现在完全由发出页错误的进程所拥有，因此内核现在可以安全地恢复新页上的写入权限。</p>
+<p>但是，内核如何在执行虚拟拷贝之前跟踪哪些页面是可写的，哪些页从来不应该是可写的？为了正确区分状态，我们必须给每个页两组权限：名义权限和实际权限。</p>
+<pre><code>int 
+pmap_copy(pde_t *spdir, uint32_t sva, pde_t *dpdir, uint32_t dva,
+        size_t size)        // 写时拷贝
+{
+    ...
+
+    pte_t* spage;
+    pte_t* dpage;
+    int page_number = size/PAGESIZE;
+    int i = 0;
+    for(i; i &lt; page_number; i++){
+        if((spage = pmap_walk(spdir, sva, false))){
+            if(!(dpage = pmap_walk(dpdir, dva, true)))
+                return false;                           // 没有可用内存。
+            if((*spage) &amp; PTE_W)    
+                *spage |= SYS_WRITE;                    // 若原页面的实际权限为可写，则名义权限为可写。   
+            if((*spage) &amp; PTE_P)
+                *spage |= SYS_READ;                     // 若原页面的实际权限为可读，则名义权限为可读。
+            *spage &amp;= (~PTE_W);                         // 拷贝后，原页面不可读。
+            *dpage = *spage;
+            uint32_t phy_add = PGADDR(*spage);
+            pageinfo* pi = mem_phys2pi(phy_add);        // 目标虚拟地址与源虚拟地址指向同一个物理地址。
+            if((PGADDR(*spage)) != PTE_ZERO)
+                mem_incref(pi);                         // 添加该物理地址的引用计数。
+        }
+        sva += PAGESIZE;
+        dva += PAGESIZE;
+    }
+</code></pre>
+
+<p>上述SYS_PERM操作影响的是目标内存区域的名义权限，名义权限有时可能与虚拟内存页的实际页权限不同。虚拟内存的名义页权限是用户级进程指定和查看的页面权限，而实际的页权限是处理器在页表的PTE_P和PTE_W位中看到的“内核内部”的权限条目。页面的名义和实际页面权限通常是相同的，但是当内核对用户模式代码透明地执行写时复制或其他虚拟内存技术时，可能会有所不同。例如，当内核使用写时拷贝来复制其名义权限为 SYS_READ | SYS_WRITE 的内存页，生成的两个页面映射的拷贝继续具有SYS_READ | SYS_WRITE 的名义权限，但内核赋给出这些映射的只有PTE_P（可读）而不是PTE_W（可写）的实际页权限。当其中一个用户进程尝试修改该页时，处理器发生页错误，因为实际的权限不允许写入。而由于内核知道其名义上允许写入，因此它复制共享页面，并提升实际权限使其等于名义权限。</p>
+<pre><code>void gcc_noreturn
+trap(trapframe *tf)
+{
+    ...
+
+    if (tf-&gt;trapno == T_PGFLT)
+        pmap_pagefault(tf);         // 当内核收到页错误陷阱时，使用pmap_pagefault 来处理。
+
+    ...
+}
+</code></pre>
+
+<p>如果用户指定的页面上的名义权限只有SYS_READ，那么内核的页面错误处理程序在一个写错误里不会自动提高页面的实际权限。对具有SYS_READ的名义权限的页面进行写操作可能是逻辑软件错误 - 或者至少意味着用户级代码不希望对该页面进行写操作 - 因此与其他异常一样，内核必须将该页面上的写入错误反映给父级进程，而不是试图透明地处理这个错误。</p>
+<pre><code>void
+pmap_pagefault(trapframe *tf)
+{
+    // 读取处理器的 CR2 寄存器找到产生错误的线性地址。
+    uint32_t fva = rcr2();
+    proc* p = proc_cur();
+    pageinfo* origin_pi;    
+
+    if((fva &lt; VM_USERLO)  | (fva &gt;= VM_USERHI)){
+        return;
+    }
+    pte_t* fault_pte_point =  pmap_walk(p-&gt;pdir, fva, false);
+    uint32_t fault_pte_content = *fault_pte_point;
+    if(!fault_pte_point){
+        return;
+    }
+    uint32_t page_flag = fault_pte_content &amp; SYS_WRITE;
+    if(!page_flag){
+        return;
+    }
+    if(PGADDR(fault_pte_content) == PTE_ZERO){
+        origin_pi = NULL;
+    }else{
+        origin_pi = mem_phys2pi(PGADDR(fault_pte_content));
+    }
+
+    if(page_flag &amp; SYS_WRITE){              // 这是虚拟地址具有写权限而实际权限不能写的情况
+        if(origin_pi-&gt;refcount &gt; 1 || (!origin_pi)){        // 页面的引用计数大于1，说明进行过写时拷贝。
+            pageinfo* new_page = mem_alloc();
+            // 分配一个新页面并将老页面的内容拷贝进去。
+            memmove((void*)mem_pi2phys(new_page),(void*)PGADDR(fault_pte_content), PAGESIZE);
+            // 将新页面映射到错误进程的虚拟地址上去。
+            pmap_insert(p-&gt;pdir, new_page, fva, SYS_RW | PTE_W | PTE_P | PTE_U);
+        }
+        if(origin_pi-&gt;refcount == 1){
+            // 若物理页面的引用计数为1， 则将页面的实际权限设置为可写。
+            pte_t* pte = pmap_walk(p-&gt;pdir, fva, false);
+            assert(pte != NULL);
+            *pte |= PTE_W;
+        }
+        // 刷新TLB缓存。
+        pmap_inval(p-&gt;pdir, PGADDR(fva), PAGESIZE);
+        trap_return(tf);
+    }
+    return;
+}
+</code></pre>
+
+<p>如果查看 inc/syscall.h 中的 SYS_READ 和 SYS_WRITE 的定义，并将其与 inc/mmu.h 中的PTE定义进行比较，你将注意到SYS_READ和SYS_WRITE都位于页表条目的PTE_AVAIL部分，这部分处理器会忽略，留给软件使用。这种设计是有意的：它使得内核能够在每个页表项的PTE_AVAIL部分中记录每个页的名义权限（由SYS_READ和SYS_WRITE位表示），而不会影响PTE在较低位中的实际页权限或12-31位中表示的物理地址。</p>
 <h2>5. 合并虚拟内存</h2>
+<p>所有现代 Unix 内核都使用相同的写时拷贝机制来提高 fork() 的效率，在通常情况下进程在 exec() 另一个程序之前只需要写入很少的几个页面。现在，我们将更进一步，提供一种合并机制，将一段时间内独立执行的子进程的结果直接并入到父地址空间里。</p>
+<p>回想一下 Unix 的 fork() 对调用 fork() 时的父进程进行一次快照，用这个快照来初始化子进程的状态。然后父子进程各自继续运行，并只能通过很小的（通常为8-bit）返回代码来进行通信，或者通过独立的抽象，如管道、socket、文件系统里的全局共享文件来通信。为了简化 PIOS 的实现，PIOS 使用虚拟内存为进程提供了一个互相通信的方法。</p>
+<p>上面实现的GET / PUT系统调用API已经为进程提供了一种“粗粒度”的通信方式：父进程可以使用SYS_PUT | SYS_COPY将自身或其他程序的数据一起复制到子进程的地址空间中，运行子进程，然后使用SYS_GET | SYS_COPY将子进程在其地址空间中留下的结果重新回收到父地址空间中以供进一步使用。这是一个粗粒度的机制，是最小粒度为4MB的地址空间区域的操作。父进程必须确切地知道子进程会将结果存储在哪个区域，以及这些结果要复制到父进程的哪个区域，避免父进程中重要的数据在复制过程中被覆盖掉。如果父进程和子进程密切相关，父进程可能希望让子进程以更精细的粒度生成结果：例如，让子进程计算分散在父进程地址空间中的一些特定的字大小的变量的新值，这些区域可能与不期望被子进程修改的内存混合在一起 - 而父进程本身和其他子进程也会同时在上面做其他操作。提供 PIOS 虚拟内存合并功能的目的就是提供这样的能力。不要害怕这个奇特的名字：它并不比简单的复制拷贝复杂得多，但需要一些解释，因为它可能是一个陌生的概念。</p>
+<h3>Merge API</h3>
+<p>PIOS 支持虚拟内存合并功能的 API 由前面简要提到的两个操作组成：</p>
+<ul>
+<li>
+<p>SYS_SNAP，仅在PUT系统调用中可用：当调用者指定此标志时，执行任何其他请求的内存及权限管理操作后，内核将对子进程的整个工作用户地址空间（从 VM_USERLO 到 VM_USERHI ）执行一次写时拷贝，放进子进程的参考地址空间（由 proc-&gt; rpdir 表示），这个操作会覆盖子进程的引用地址空间中的任何先前状态。</p>
+<pre><code>static void
+do_put(trapframe *tf, uint32_t cmd){    
+
+    ...
+
+    switch(flag &amp; SYS_MEMOP){
+
+    ...
+
+    }
+    if(flag &amp; SYS_SNAP){
+        assert(size%PTSIZE == 0);
+        assert((source_add)%PTSIZE == 0);
+        assert((dest_add)%PTSIZE == 0);
+        checkva(tf, source_add, size);
+        checkva(tf, dest_add, size);
+        // 将父进程的快照放到子进程的 rpdir 指针里。这个过程只需要调用前面实现的 pmap_copy 写时拷贝函数。
+        if(!pmap_copy(child-&gt;pdir, source_add, child-&gt;rpdir, dest_add, size))
+            panic(&quot;pmap_copy does not finished.\n&quot;);
+    }
+
+    ...
+
+}
+</code></pre>
+
+</li>
+<li>
+<p>SYS_MERGE，仅在GET系统调用中可用：当调用者指定此内存操作时，内核将数据复制到父进程中，如 SYS_COPY所做的类似，不同的是内核只复制一部分子进程的地址空间，这部分地址空间的内容相对于子进程的最后一个参考快照已经发生了改变。这种合并过程以32位机器字的粒度进行：如果子进程的工作地址空间的中特定页面中的某些字与参考空间中的相应字不同，那么内核只将这些字复制到父进程的目标区域里，该页的其他字的值不变。</p>
+<pre><code>static void
+do_get(trapframe *tf, uint32_t cmd){
+
+    ...
+
+    switch(flag &amp; SYS_MEMOP){
+
+    ...
+
+    }
+
+    if((flag &amp; SYS_MEMOP) == SYS_MERGE){
+        assert(size%PTSIZE == 0);
+        assert((source_add)%PTSIZE == 0);
+        assert((dest_add)%PTSIZE == 0);
+        checkva(tf, source_add, size);
+        checkva(tf, dest_add, size);
+        // 合并虚拟内存。
+        pmap_merge(child-&gt;rpdir, child-&gt;pdir, source_add, parent-&gt;pdir, dest_add, size);
+    }
+
+    ...
+}
+</code></pre>
+
+</li>
+</ul>
+<p>当执行合并时，内核不需要将子进程地址空间的合并部分中的每个页面的每个字与子进程的参考空间中相应的字进行比较。由于孩子的参考空间只是子进程工作空间的写时拷贝，所以如果子进程工作空间里的页面没被修改，那么这些页面仍然和参考空间中的页面相同。因此，对于这样的页面，内核只需要比较页表项。</p>
+<pre><code>// 
+// Merge differences between a reference snapshot represented by rpdir
+// and a source address space spdir into a destination address space dpdir.
+//
+int
+pmap_merge(pde_t *rpdir, pde_t *spdir, uint32_t sva,
+        pde_t *dpdir, uint32_t dva, size_t size)
+{
+    assert(PTOFF(sva) == 0);    // must be 4MB-aligned
+    assert(PTOFF(dva) == 0);
+    assert(PTOFF(size) == 0);
+    assert(sva &gt;= VM_USERLO &amp;&amp; sva &lt; VM_USERHI);
+    assert(dva &gt;= VM_USERLO &amp;&amp; dva &lt; VM_USERHI);
+    assert(size &lt;= VM_USERHI - sva);
+    assert(size &lt;= VM_USERHI - dva);
+
+    uint32_t tmp_va = sva;
+    while(tmp_va &lt; sva + size){
+        uint32_t rpde = rpdir[PDX(tmp_va)];
+        uint32_t spde = spdir[PDX(tmp_va)];
+        if(PGADDR(spde) == PTE_ZERO){
+            tmp_va += PTSIZE;
+            continue;
+        }
+        pte_t* rpte = pmap_walk(rpdir, tmp_va, false);
+        pte_t* spte = pmap_walk(spdir, tmp_va, false);
+
+        //  快照与当前工作空间页表项相同说明页面内容没有改变。
+        if(*rpte == *spte){
+            tmp_va += PAGESIZE;     
+            continue;
+        }
+
+        // 工作空间为 PTE_ZERO 时，不改变父进程中的页面内容。
+        if(PGADDR(*spte) == PTE_ZERO){
+            tmp_va += PAGESIZE;
+            continue;
+        }
+
+        // 找到改变的位置时，先为父进程分配一个可写的新物理页。
+        pte_t* dpte = pmap_walk(dpdir, tmp_va, true);
+        if(!dpte)
+            panic(&quot;in pmap_merge, has no pte.\n&quot;);
+        if(PGADDR(*dpte) == PGADDR(*rpte)){
+            uint32_t perm = 0;
+            pageinfo* dpage = mem_alloc();
+            if(!dpage)
+                panic(&quot;in pmap_merge, has no page.\n&quot;);
+            mem_incref(dpage);
+            mem_pi2phys(dpage);
+            memmove((void*)mem_pi2phys(dpage), (void*)PGADDR(*dpte), PAGESIZE);
+            if((*dpte &amp; SYS_READ))
+                perm = perm | PTE_P | PTE_U;
+            if((*dpte &amp; SYS_WRITE))
+                perm = perm | PTE_W;
+            pmap_insert(dpdir, dpage, tmp_va, perm);
+        }
+        // 开始合并。
+        pmap_mergepage(rpte, spte, dpte, dva);
+        tmp_va += PAGESIZE;
+    }
+    return 1;
+}
+
+
+void
+pmap_mergepage(pte_t *rpte, pte_t *spte, pte_t *dpte, uint32_t dva)
+{
+    uint32_t i = 0;
+    // 参考空间相应页面不存在时的情况，只要有内容就进行拷贝。
+    if(!rpte || *rpte == PTE_ZERO){
+        while(i &lt; PAGESIZE){
+            uint32_t cmp_sadd = PGADDR(*spte);
+            uint32_t cmp_dadd = PGADDR(*dpte);
+            cmp_dadd += i*8;
+            cmp_sadd += i*8;
+            if(*(uint32_t*)cmp_sadd)
+                memmove((void*)cmp_dadd, (void*)cmp_sadd, 4);
+            i += 4;
+        }
+    }else{
+        // 参考空间相应页面存在时的情况，只拷贝与参考空间相应页面里不同的地方，按一个字的大小比较。
+        while(i &lt; PAGESIZE){
+            uint32_t cmp_radd = PGADDR(*rpte);
+            uint32_t cmp_sadd = PGADDR(*spte);
+            uint32_t cmp_dadd = PGADDR(*dpte);
+            cmp_radd += i;
+            cmp_dadd += i;
+            cmp_sadd += i;
+            if(memcmp((void*)cmp_radd,(void*)cmp_sadd, 4))
+                memmove((void*)cmp_dadd, (void*)cmp_sadd, 4);
+            i += 4;
+        }
+    }
+}
+</code></pre>
+
 
 </body>
 </html>
